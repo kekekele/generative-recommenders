@@ -294,6 +294,7 @@ def make_optimizer_and_shard(
     sparse_opt_cls, sparse_opt_args, sparse_opt_factory = (
         sparse_optimizer_factory_and_class()
     )
+
     def _materialize_meta_embeddings(module: torch.nn.Module) -> None:
         # Non-CUDA path does not use torchrec DMP sharding, so meta embedding tables
         # must be explicitly materialized before model.to(device).
@@ -502,9 +503,9 @@ def train_loop(
             optimizer.step()
             metric_logger.update(
                 mode="train",
-                predictions=mt_target_preds,
-                labels=mt_target_labels,
-                weights=mt_target_weights,
+                predictions=mt_target_preds.detach(),
+                labels=mt_target_labels.detach(),
+                weights=mt_target_weights.detach(),
                 num_candidates=sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0],
@@ -566,9 +567,9 @@ def eval_loop(
             )
             metric_logger.update(
                 mode="eval",
-                predictions=mt_target_preds,
-                labels=mt_target_labels,
-                weights=mt_target_weights,
+                predictions=mt_target_preds.detach(),
+                labels=mt_target_labels.detach(),
+                weights=mt_target_weights.detach(),
                 num_candidates=sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0],
@@ -642,9 +643,9 @@ def train_eval_loop(
             optimizer.step()
             metric_logger.update(
                 mode="train",
-                predictions=mt_target_preds,
-                labels=mt_target_labels,
-                weights=mt_target_weights,
+                predictions=mt_target_preds.detach(),
+                labels=mt_target_labels.detach(),
+                weights=mt_target_weights.detach(),
                 num_candidates=sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0],
@@ -692,9 +693,9 @@ def train_eval_loop(
                         )
                         metric_logger.update(
                             mode="eval",
-                            predictions=mt_target_preds,
-                            labels=mt_target_labels,
-                            weights=mt_target_weights,
+                            predictions=mt_target_preds.detach(),
+                            labels=mt_target_labels.detach(),
+                            weights=mt_target_weights.detach(),
                             num_candidates=sample.candidates_features_kjt.lengths().view(
                                 len(sample.candidates_features_kjt.keys()), -1
                             )[0],
@@ -767,9 +768,9 @@ def streaming_train_eval_loop(
             optimizer.step()
             metric_logger.update(
                 mode="train",
-                predictions=mt_target_preds,
-                labels=mt_target_labels,
-                weights=mt_target_weights,
+                predictions=mt_target_preds.detach(),
+                labels=mt_target_labels.detach(),
+                weights=mt_target_weights.detach(),
                 num_candidates=sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0],
@@ -813,9 +814,9 @@ def streaming_train_eval_loop(
                 )
                 metric_logger.update(
                     mode="eval",
-                    predictions=mt_target_preds,
-                    labels=mt_target_labels,
-                    weights=mt_target_weights,
+                    predictions=mt_target_preds.detach(),
+                    labels=mt_target_labels.detach(),
+                    weights=mt_target_weights.detach(),
                     num_candidates=sample.candidates_features_kjt.lengths().view(
                         len(sample.candidates_features_kjt.keys()), -1
                     )[0],
@@ -867,9 +868,9 @@ def streaming_train_eval_loop(
             )
             metric_logger.update(
                 mode="eval",
-                predictions=mt_target_preds,
-                labels=mt_target_labels,
-                weights=mt_target_weights,
+                predictions=mt_target_preds.detach(),
+                labels=mt_target_labels.detach(),
+                weights=mt_target_weights.detach(),
                 num_candidates=sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0],

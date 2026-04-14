@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from generative_recommenders.common import HammerKernel
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTU, DlrmHSTUConfig
 from generative_recommenders.modules.multitask_module import MultitaskTaskType
 from torchrec.modules.embedding_configs import EmbeddingConfig
@@ -101,7 +102,7 @@ class RankingGRAdapter(torch.nn.Module):
     def set_is_inference(self, is_inference: bool) -> None:
         self._is_inference = is_inference
         self._backbone.set_is_inference(is_inference)
-        
+
     def forward(
         self,
         uih_features: KeyedJaggedTensor,
@@ -116,14 +117,16 @@ class RankingGRAdapter(torch.nn.Module):
     ]:
         (
             candidates_user_embeddings,
-            candidates_item_embeddings,
-            _,
-            _,
             mt_target_labels,
             mt_target_weights,
-        ) = self._backbone(
+        ) = self._backbone.forward_user_tower(
             uih_features=uih_features,
             candidates_features=candidates_features,
+        )
+        candidates_item_embeddings = torch.empty(
+            0,
+            device=candidates_user_embeddings.device,
+            dtype=candidates_user_embeddings.dtype,
         )
 
         logits = self._ranking_head(candidates_user_embeddings).transpose(0, 1)

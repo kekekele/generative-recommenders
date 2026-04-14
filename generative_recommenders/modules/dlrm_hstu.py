@@ -119,6 +119,29 @@ def _get_supervision_labels_and_weights(
     return supervision_labels, supervision_weights
 
 
+def _stack_multitask_targets(
+    supervision_labels: Dict[str, torch.Tensor],
+    supervision_weights: Dict[str, torch.Tensor],
+    task_configs: List[TaskConfig],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    first_label = list(supervision_labels.values())[0]
+    default_weight = torch.ones_like(
+        first_label,
+        dtype=torch.float32,
+        device=first_label.device,
+    )
+    mt_labels_list: List[torch.Tensor] = []
+    mt_weights_list: List[torch.Tensor] = []
+    for task in task_configs:
+        mt_labels_list.append(supervision_labels[task.task_name])
+        mt_weights_list.append(
+            supervision_weights.get(task.task_name, default_weight)
+        )
+    if len(task_configs) > 1:
+        return torch.stack(mt_labels_list, dim=0), torch.stack(mt_weights_list, dim=0)
+    return mt_labels_list[0].unsqueeze(0), mt_weights_list[0].unsqueeze(0)
+
+
 class DlrmHSTU(HammerModule):
     def __init__(  # noqa C901
         self,
@@ -479,28 +502,13 @@ class DlrmHSTU(HammerModule):
         Optional[torch.Tensor],
     ]:
         # merge uih and candidates embeddings
-        for (
-            uih_feature_name,
-            candidate_feature_name,
-        ) in self._hstu_configs.merge_uih_candidate_feature_mapping:
-            if uih_feature_name in seq_embeddings:
-                seq_embeddings[uih_feature_name] = SequenceEmbedding(
-                    lengths=uih_seq_lengths + num_candidates,
-                    embedding=concat_2D_jagged(
-                        max_seq_len=max_uih_len + max_num_candidates,
-                        max_len_left=max_uih_len,
-                        offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
-                            uih_seq_lengths
-                        ),
-                        values_left=seq_embeddings[uih_feature_name].embedding,
-                        max_len_right=max_num_candidates,
-                        offsets_right=torch.ops.fbgemm.asynchronous_complete_cumsum(
-                            num_candidates
-                        ),
-                        values_right=seq_embeddings[candidate_feature_name].embedding,
-                        kernel=self.hammer_kernel(),
-                    ),
-                )
+        self._merge_uih_and_candidate_embeddings(
+            seq_embeddings=seq_embeddings,
+            uih_seq_lengths=uih_seq_lengths,
+            max_uih_len=max_uih_len,
+            max_num_candidates=max_num_candidates,
+            num_candidates=num_candidates,
+        )
 
         with record_function("## item_forward ##"):
             candidates_item_embeddings = self._item_forward(
@@ -548,6 +556,99 @@ class DlrmHSTU(HammerModule):
             mt_target_labels,
             mt_target_weights,
         )
+
+    def _merge_uih_and_candidate_embeddings(
+        self,
+        seq_embeddings: Dict[str, SequenceEmbedding],
+        uih_seq_lengths: torch.Tensor,
+        max_uih_len: int,
+        max_num_candidates: int,
+        num_candidates: torch.Tensor,
+    ) -> None:
+        for (
+            uih_feature_name,
+            candidate_feature_name,
+        ) in self._hstu_configs.merge_uih_candidate_feature_mapping:
+            if uih_feature_name in seq_embeddings:
+                seq_embeddings[uih_feature_name] = SequenceEmbedding(
+                    lengths=uih_seq_lengths + num_candidates,
+                    embedding=concat_2D_jagged(
+                        max_seq_len=max_uih_len + max_num_candidates,
+                        max_len_left=max_uih_len,
+                        offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
+                            uih_seq_lengths
+                        ),
+                        values_left=seq_embeddings[uih_feature_name].embedding,
+                        max_len_right=max_num_candidates,
+                        offsets_right=torch.ops.fbgemm.asynchronous_complete_cumsum(
+                            num_candidates
+                        ),
+                        values_right=seq_embeddings[candidate_feature_name].embedding,
+                        kernel=self.hammer_kernel(),
+                    ),
+                )
+
+    def _get_candidate_targets(
+        self,
+        payload_features: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        supervision_labels, supervision_weights = _get_supervision_labels_and_weights(
+            supervision_bitmasks=payload_features[
+                self._hstu_configs.candidates_weight_feature_name
+            ],
+            watchtime_sequence=payload_features[
+                self._hstu_configs.candidates_watchtime_feature_name
+            ],
+            task_configs=self._multitask_configs,
+        )
+        return _stack_multitask_targets(
+            supervision_labels=supervision_labels,
+            supervision_weights=supervision_weights,
+            task_configs=self._multitask_configs,
+        )
+
+    def forward_user_tower(
+        self,
+        uih_features: KeyedJaggedTensor,
+        candidates_features: KeyedJaggedTensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        with record_function("## preprocess ##"):
+            (
+                seq_embeddings,
+                payload_features,
+                max_uih_len,
+                uih_seq_lengths,
+                max_num_candidates,
+                num_candidates,
+            ) = self.preprocess(
+                uih_features=uih_features,
+                candidates_features=candidates_features,
+            )
+
+        with record_function("## merge_embeddings ##"):
+            self._merge_uih_and_candidate_embeddings(
+                seq_embeddings=seq_embeddings,
+                uih_seq_lengths=uih_seq_lengths,
+                max_uih_len=max_uih_len,
+                max_num_candidates=max_num_candidates,
+                num_candidates=num_candidates,
+            )
+
+        with record_function("## user_forward ##"):
+            candidates_user_embeddings = self._user_forward(
+                max_uih_len=max_uih_len,
+                max_candidates=max_num_candidates,
+                seq_embeddings=seq_embeddings,
+                payload_features=payload_features,
+                num_candidates=num_candidates,
+            )
+
+        with record_function("## supervision_targets ##"):
+            mt_target_labels, mt_target_weights = self._get_candidate_targets(
+                payload_features=payload_features,
+            )
+
+        return candidates_user_embeddings, mt_target_labels, mt_target_weights
 
     def forward(
         self,
