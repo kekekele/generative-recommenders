@@ -77,6 +77,148 @@ TORCHREC_TYPES: Set[Type[Union[EmbeddingBagCollection, EmbeddingCollection]]] = 
 }
 
 
+def _device_memory_snapshot(device: torch.device) -> str:
+    try:
+        if device.type == "cuda" and torch.cuda.is_available():
+            return (
+                f"cuda allocated={torch.cuda.memory_allocated(device)} "
+                f"reserved={torch.cuda.memory_reserved(device)} "
+                f"max_allocated={torch.cuda.max_memory_allocated(device)} "
+                f"max_reserved={torch.cuda.max_memory_reserved(device)}"
+            )
+        if (
+            device.type == "npu"
+            and hasattr(torch, "npu")
+            and torch.npu.is_available()  # pyre-ignore[16]
+        ):
+            allocated = (
+                torch.npu.memory_allocated(device)  # pyre-ignore[16]
+                if hasattr(torch.npu, "memory_allocated")  # pyre-ignore[16]
+                else -1
+            )
+            reserved = (
+                torch.npu.memory_reserved(device)  # pyre-ignore[16]
+                if hasattr(torch.npu, "memory_reserved")  # pyre-ignore[16]
+                else -1
+            )
+            max_allocated = (
+                torch.npu.max_memory_allocated(device)  # pyre-ignore[16]
+                if hasattr(torch.npu, "max_memory_allocated")  # pyre-ignore[16]
+                else -1
+            )
+            max_reserved = (
+                torch.npu.max_memory_reserved(device)  # pyre-ignore[16]
+                if hasattr(torch.npu, "max_memory_reserved")  # pyre-ignore[16]
+                else -1
+            )
+            return (
+                f"npu allocated={allocated} reserved={reserved} "
+                f"max_allocated={max_allocated} max_reserved={max_reserved}"
+            )
+    except Exception as e:
+        return f"memory_snapshot_error={repr(e)}"
+    return f"memory_snapshot_unavailable device={device}"
+
+
+def _log_step_debug_info(
+    loop_name: str,
+    step_idx: int,
+    device: torch.device,
+    sample: Any,
+    aux_losses: Dict[str, torch.Tensor],
+    mt_target_preds: Optional[torch.Tensor],
+    mt_target_labels: Optional[torch.Tensor],
+    mt_target_weights: Optional[torch.Tensor],
+) -> None:
+    logger.info(
+        f"[{loop_name}] step={step_idx} device={device} mem_before={_device_memory_snapshot(device)}"
+    )
+    if mt_target_preds is not None:
+        logger.info(
+            f"[{loop_name}] preds shape={tuple(mt_target_preds.shape)} dtype={mt_target_preds.dtype} "
+            f"requires_grad={mt_target_preds.requires_grad}"
+        )
+    if mt_target_labels is not None:
+        logger.info(
+            f"[{loop_name}] labels shape={tuple(mt_target_labels.shape)} dtype={mt_target_labels.dtype}"
+        )
+    if mt_target_weights is not None:
+        logger.info(
+            f"[{loop_name}] weights shape={tuple(mt_target_weights.shape)} dtype={mt_target_weights.dtype}"
+        )
+
+    for loss_name, loss_value in aux_losses.items():
+        detached = loss_value.detach()
+        logger.info(
+            f"[{loop_name}] aux_loss name={loss_name} shape={tuple(loss_value.shape)} "
+            f"dtype={loss_value.dtype} requires_grad={loss_value.requires_grad} "
+            f"value_mean={float(detached.float().mean().item()):.6f}"
+        )
+
+    try:
+        uih_lengths = sample.uih_features_kjt.lengths().view(
+            len(sample.uih_features_kjt.keys()), -1
+        )
+        cand_lengths = sample.candidates_features_kjt.lengths().view(
+            len(sample.candidates_features_kjt.keys()), -1
+        )
+        logger.info(
+            f"[{loop_name}] uih_lengths max={int(uih_lengths.max().item())} "
+            f"mean={float(uih_lengths.float().mean().item()):.2f}"
+        )
+        logger.info(
+            f"[{loop_name}] candidate_lengths max={int(cand_lengths.max().item())} "
+            f"mean={float(cand_lengths.float().mean().item()):.2f} "
+            f"num_candidates_batch={cand_lengths[0].tolist()}"
+        )
+    except Exception as e:
+        logger.warning(f"[{loop_name}] failed_to_log_lengths error={repr(e)}")
+
+
+def _run_backward_with_oom_logging(
+    loop_name: str,
+    step_idx: int,
+    device: torch.device,
+    sample: Any,
+    aux_losses: Dict[str, torch.Tensor],
+    mt_target_preds: Optional[torch.Tensor],
+    mt_target_labels: Optional[torch.Tensor],
+    mt_target_weights: Optional[torch.Tensor],
+) -> None:
+    if not aux_losses:
+        raise RuntimeError(f"[{loop_name}] aux_losses is empty, cannot run backward")
+    _log_step_debug_info(
+        loop_name=loop_name,
+        step_idx=step_idx,
+        device=device,
+        sample=sample,
+        aux_losses=aux_losses,
+        mt_target_preds=mt_target_preds,
+        mt_target_labels=mt_target_labels,
+        mt_target_weights=mt_target_weights,
+    )
+    try:
+        sum(aux_losses.values()).backward()
+    except RuntimeError as e:
+        err_msg = str(e).lower()
+        if "out of memory" in err_msg or "oom" in err_msg:
+            logger.error(
+                f"[{loop_name}] backward_oom step={step_idx} device={device} "
+                f"mem_after_exception={_device_memory_snapshot(device)}"
+            )
+            _log_step_debug_info(
+                loop_name=loop_name,
+                step_idx=step_idx,
+                device=device,
+                sample=sample,
+                aux_losses=aux_losses,
+                mt_target_preds=mt_target_preds,
+                mt_target_labels=mt_target_labels,
+                mt_target_weights=mt_target_weights,
+            )
+        raise
+
+
 def setup(
     rank: int,
     world_size: int,
@@ -498,8 +640,16 @@ def train_loop(
                 sample.uih_features_kjt,
                 sample.candidates_features_kjt,
             )
-            # pyre-ignore
-            sum(aux_losses.values()).backward()
+            _run_backward_with_oom_logging(
+                loop_name="train_loop",
+                step_idx=batch_idx,
+                device=device,
+                sample=sample,
+                aux_losses=aux_losses,
+                mt_target_preds=mt_target_preds,
+                mt_target_labels=mt_target_labels,
+                mt_target_weights=mt_target_weights,
+            )
             optimizer.step()
             metric_logger.update(
                 mode="train",
@@ -638,8 +788,16 @@ def train_eval_loop(
                 sample.uih_features_kjt,
                 sample.candidates_features_kjt,
             )
-            # pyre-ignore
-            sum(aux_losses.values()).backward()
+            _run_backward_with_oom_logging(
+                loop_name="train_eval_loop",
+                step_idx=train_batch_idx,
+                device=device,
+                sample=sample,
+                aux_losses=aux_losses,
+                mt_target_preds=mt_target_preds,
+                mt_target_labels=mt_target_labels,
+                mt_target_weights=mt_target_weights,
+            )
             optimizer.step()
             metric_logger.update(
                 mode="train",
@@ -763,8 +921,16 @@ def streaming_train_eval_loop(
                 sample.uih_features_kjt,
                 sample.candidates_features_kjt,
             )
-            # pyre-ignore
-            sum(aux_losses.values()).backward()
+            _run_backward_with_oom_logging(
+                loop_name="streaming_train_eval_loop",
+                step_idx=train_batch_idx,
+                device=device,
+                sample=sample,
+                aux_losses=aux_losses,
+                mt_target_preds=mt_target_preds,
+                mt_target_labels=mt_target_labels,
+                mt_target_weights=mt_target_weights,
+            )
             optimizer.step()
             metric_logger.update(
                 mode="train",
