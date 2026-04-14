@@ -294,8 +294,18 @@ def make_optimizer_and_shard(
     sparse_opt_cls, sparse_opt_args, sparse_opt_factory = (
         sparse_optimizer_factory_and_class()
     )
+    def _materialize_meta_embeddings(module: torch.nn.Module) -> None:
+        # Non-CUDA path does not use torchrec DMP sharding, so meta embedding tables
+        # must be explicitly materialized before model.to(device).
+        for submodule in module.modules():
+            if isinstance(submodule, (EmbeddingCollection, EmbeddingBagCollection)):
+                submodule.to_empty(device=device)
+                if hasattr(submodule, "reset_parameters"):
+                    submodule.reset_parameters()
+
     # Non-CUDA accelerators fall back to plain optimizer path.
     if accelerator != "cuda":
+        _materialize_meta_embeddings(model)
         model = model.to(device)
         dense_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = dense_opt_factory(dense_params)

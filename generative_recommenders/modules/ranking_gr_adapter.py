@@ -89,6 +89,19 @@ class RankingGRAdapter(torch.nn.Module):
             bias=cfg.prediction_head_bias,
         )
 
+    def set_hammer_kernel(self, hammer_kernel: HammerKernel) -> None:
+        self._backbone.set_hammer_kernel(hammer_kernel)
+
+    def set_use_triton_cc(self, use_triton_cc: bool) -> None:
+        self._backbone.set_use_triton_cc(use_triton_cc)
+
+    def set_training_dtype(self, training_dtype: torch.dtype) -> None:
+        self._backbone.set_training_dtype(training_dtype)
+
+    def set_is_inference(self, is_inference: bool) -> None:
+        self._is_inference = is_inference
+        self._backbone.set_is_inference(is_inference)
+        
     def forward(
         self,
         uih_features: KeyedJaggedTensor,
