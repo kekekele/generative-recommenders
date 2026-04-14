@@ -31,6 +31,8 @@ from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
 HSTU_EMBEDDING_DIM = 512  # final DLRMv3 model
 HASH_SIZE = 10_000_000
 HASH_SIZE_1B = 1_000_000_000
+DEBUG_HSTU_EMBEDDING_DIM = 128
+DEBUG_HASH_SIZE = 100_000
 
 
 def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
@@ -47,14 +49,19 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
     Returns:
         DlrmHSTUConfig: Complete configuration object for the HSTU model.
     """
+    is_debug = dataset == "debug"
     hstu_config = DlrmHSTUConfig(
-        hstu_num_heads=4,
-        hstu_attn_linear_dim=128,
-        hstu_attn_qk_dim=128,
-        hstu_attn_num_layers=5,
-        hstu_embedding_table_dim=HSTU_EMBEDDING_DIM,
-        hstu_preprocessor_hidden_dim=256,
-        hstu_transducer_embedding_dim=512,
+        hstu_num_heads=1 if is_debug else 4,
+        hstu_attn_linear_dim=64 if is_debug else 128,
+        hstu_attn_qk_dim=64 if is_debug else 128,
+        hstu_attn_num_layers=2 if is_debug else 5,
+        hstu_embedding_table_dim=(
+            DEBUG_HSTU_EMBEDDING_DIM if is_debug else HSTU_EMBEDDING_DIM
+        ),
+        hstu_preprocessor_hidden_dim=128 if is_debug else 256,
+        hstu_transducer_embedding_dim=(
+            DEBUG_HSTU_EMBEDDING_DIM if is_debug else 512
+        ),
         hstu_group_norm=False,
         hstu_input_dropout_ratio=0.2,
         hstu_linear_dropout_rate=0.1,
@@ -540,10 +547,14 @@ def get_embedding_table_config(dataset: str = "debug") -> Dict[str, EmbeddingCon
             ),
         }
     else:
+        debug_hash_size = DEBUG_HASH_SIZE if dataset == "debug" else HASH_SIZE
+        debug_embedding_dim = (
+            DEBUG_HSTU_EMBEDDING_DIM if dataset == "debug" else HSTU_EMBEDDING_DIM
+        )
         return {
             "post_id": EmbeddingConfig(
-                num_embeddings=HASH_SIZE,
-                embedding_dim=HSTU_EMBEDDING_DIM,
+                num_embeddings=debug_hash_size,
+                embedding_dim=debug_embedding_dim,
                 name="post_id",
                 data_type=DataType.FP16,
                 feature_names=[
@@ -554,15 +565,15 @@ def get_embedding_table_config(dataset: str = "debug") -> Dict[str, EmbeddingCon
                 ],
             ),
             "viewer_id": EmbeddingConfig(
-                num_embeddings=HASH_SIZE,
-                embedding_dim=HSTU_EMBEDDING_DIM,
+                num_embeddings=debug_hash_size,
+                embedding_dim=debug_embedding_dim,
                 name="viewer_id",
                 data_type=DataType.FP16,
                 feature_names=["viewer_id"],
             ),
             "dummy_contexual": EmbeddingConfig(
-                num_embeddings=HASH_SIZE,
-                embedding_dim=HSTU_EMBEDDING_DIM,
+                num_embeddings=debug_hash_size,
+                embedding_dim=debug_embedding_dim,
                 name="dummy_contexual",
                 data_type=DataType.FP16,
                 feature_names=["dummy_contexual"],
