@@ -15,6 +15,7 @@
 # pyre-strict
 import argparse
 import logging
+from typing import List
 
 logging.basicConfig(level=logging.INFO)
 import os
@@ -23,6 +24,7 @@ import traceback
 
 import gin
 import torch
+from generative_recommenders.common import HammerKernel
 from generative_recommenders.dlrm_v3.checkpoint import load_dmp_checkpoint
 from generative_recommenders.dlrm_v3.train.utils import (
     cleanup,
@@ -36,6 +38,11 @@ from generative_recommenders.dlrm_v3.train.utils import (
     train_loop,
 )
 from generative_recommenders.dlrm_v3.utils import MetricsLogger
+from generative_recommenders.runtime.device import (
+    detect_accelerator,
+    get_device_count,
+    get_device_for_rank,
+)
 from torch import multiprocessing as mp
 from torchrec.test_utils import get_free_port
 
@@ -44,6 +51,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 SUPPORTED_CONFIGS = {
     "debug": "debug.gin",
+    "debug-ranking-adapter": "debug_ranking_adapter.gin",
     "kuairand-1k": "kuairand_1k.gin",
     "movielens-1m": "movielens_1m.gin",
     "movielens-20m": "movielens_20m.gin",
@@ -61,21 +69,32 @@ def _main_func(
     master_port: int,
     gin_file: str,
     mode: str,
+    accelerator: str,
+    gin_bindings: List[str],
 ) -> None:
-    device = torch.device(f"cuda:{rank}")
+    device = get_device_for_rank(rank=rank, accelerator=accelerator)
     logger.info(f"rank: {rank}, world_size: {world_size}, device: {device}")
     setup(
         rank=rank,
         world_size=world_size,
         master_port=master_port,
         device=device,
+        accelerator=accelerator,
     )
     # parse all arguments
     gin.parse_config_file(gin_file)
+    if gin_bindings:
+        gin.parse_config(gin_bindings)
 
     model, model_configs, embedding_table_configs = make_model()
+    if accelerator != "cuda" and hasattr(model, "set_hammer_kernel"):
+        # Triton/CUDA kernels are not available on NPU/CPU.
+        model.set_hammer_kernel(HammerKernel.PYTORCH)
     model, optimizer = make_optimizer_and_shard(
-        model=model, device=device, world_size=world_size
+        model=model,
+        device=device,
+        world_size=world_size,
+        accelerator=accelerator,
     )
     train_dataloader, test_dataloader = make_train_test_dataloaders(
         hstu_config=model_configs,
@@ -157,6 +176,18 @@ def get_args():  # pyre-ignore [3]
         choices=["train", "eval", "train-eval", "streaming-train-eval"],
         help="mode",
     )
+    parser.add_argument(
+        "--accelerator",
+        default="auto",
+        choices=["auto", "cuda", "npu", "cpu"],
+        help="execution device type",
+    )
+    parser.add_argument(
+        "--gin-binding",
+        action="append",
+        default=[],
+        help="Additional gin binding, can be passed multiple times",
+    )
     args, unknown_args = parser.parse_known_args()
     logger.warning(f"unknown_args: {unknown_args}")
     return args
@@ -173,12 +204,15 @@ def main() -> None:
         "streaming-train-eval",
     ], f"Unsupported mode: {args.mode}"
     WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+    accelerator = detect_accelerator(args.accelerator)
+    if "WORLD_SIZE" not in os.environ:
+        WORLD_SIZE = max(1, get_device_count(accelerator))
     MASTER_PORT = str(get_free_port())
     gin_path = f"{os.path.dirname(__file__)}/gin/{SUPPORTED_CONFIGS[args.dataset]}"
 
     mp.start_processes(
         _main_func,
-        args=(WORLD_SIZE, MASTER_PORT, gin_path, args.mode),
+        args=(WORLD_SIZE, MASTER_PORT, gin_path, args.mode, accelerator, args.gin_binding),
         nprocs=WORLD_SIZE,
         join=True,
         start_method="spawn",

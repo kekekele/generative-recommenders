@@ -41,6 +41,14 @@ from generative_recommenders.dlrm_v3.configs import (
 from generative_recommenders.dlrm_v3.datasets.dataset import collate_fn, Dataset
 from generative_recommenders.dlrm_v3.utils import get_dataset, MetricsLogger, Profiler
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTU, DlrmHSTUConfig
+from generative_recommenders.modules.ranking_gr_adapter import (
+    RankingAdapterConfig,
+    RankingGRAdapter,
+)
+from generative_recommenders.runtime.device import (
+    dist_backend_for_accelerator,
+    set_current_device,
+)
 from torch import distributed as dist
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
@@ -70,17 +78,21 @@ TORCHREC_TYPES: Set[Type[Union[EmbeddingBagCollection, EmbeddingCollection]]] = 
 
 
 def setup(
-    rank: int, world_size: int, master_port: int, device: torch.device
+    rank: int,
+    world_size: int,
+    master_port: int,
+    device: torch.device,
+    accelerator: str,
 ) -> dist.ProcessGroup:
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(master_port)
 
-    BACKEND = dist.Backend.NCCL
+    BACKEND = dist_backend_for_accelerator(accelerator)
     TIMEOUT = 1800
 
     # initialize the process group
     if not dist.is_initialized():
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        dist.init_process_group(BACKEND, rank=rank, world_size=world_size)
 
     pg = dist.new_group(
         backend=BACKEND,
@@ -88,7 +100,7 @@ def setup(
     )
 
     # set device
-    torch.cuda.set_device(device)
+    set_current_device(device)
 
     return pg
 
@@ -165,15 +177,33 @@ class ChunkDistributedSampler(DistributedSampler[_T_co]):
 @gin.configurable
 def make_model(
     dataset: str,
+    model_variant: str = "dlrm_hstu",
+    ranking_prediction_head_arch: Tuple[int, ...] = (512, 1),
+    ranking_prediction_head_act_type: str = "relu",
+    ranking_prediction_head_bias: bool = True,
 ) -> Tuple[torch.nn.Module, DlrmHSTUConfig, Dict[str, EmbeddingConfig]]:
     hstu_config = get_hstu_configs(dataset)
     table_config = get_embedding_table_config(dataset)
 
-    model = DlrmHSTU(
-        hstu_configs=hstu_config,
-        embedding_tables=table_config,
-        is_inference=False,
-    )
+    if model_variant == "dlrm_hstu":
+        model = DlrmHSTU(
+            hstu_configs=hstu_config,
+            embedding_tables=table_config,
+            is_inference=False,
+        )
+    elif model_variant == "ranking_gr_adapter":
+        model = RankingGRAdapter(
+            hstu_configs=hstu_config,
+            embedding_tables=table_config,
+            is_inference=False,
+            ranking_config=RankingAdapterConfig(
+                prediction_head_arch=ranking_prediction_head_arch,
+                prediction_head_act_type=ranking_prediction_head_act_type,
+                prediction_head_bias=ranking_prediction_head_bias,
+            ),
+        )
+    else:
+        raise ValueError(f"Unsupported model_variant: {model_variant}")
 
     return (
         model,
@@ -255,6 +285,7 @@ def make_optimizer_and_shard(
     model: torch.nn.Module,
     device: torch.device,
     world_size: int,
+    accelerator: str,
 ) -> Tuple[DistributedModelParallel, torch.optim.Optimizer]:
     dense_opt_cls, dense_opt_args, dense_opt_factory = (
         dense_optimizer_factory_and_class()
@@ -263,6 +294,13 @@ def make_optimizer_and_shard(
     sparse_opt_cls, sparse_opt_args, sparse_opt_factory = (
         sparse_optimizer_factory_and_class()
     )
+    # Non-CUDA accelerators fall back to plain optimizer path.
+    if accelerator != "cuda":
+        model = model.to(device)
+        dense_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = dense_opt_factory(dense_params)
+        return model, optimizer  # pyre-ignore [7]
+
     # Fuse sparse optimizer to backward step
     for k, module in model.named_modules():
         if type(module) in TORCHREC_TYPES:
@@ -276,7 +314,7 @@ def make_optimizer_and_shard(
         topology=Topology(
             local_world_size=world_size,
             world_size=world_size,
-            compute_device="cuda",
+            compute_device=accelerator,
             hbm_cap=160 * 1024 * 1024 * 1024,
             ddr_cap=32 * 1024 * 1024 * 1024,
         )

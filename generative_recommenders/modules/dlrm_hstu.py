@@ -30,6 +30,7 @@ from generative_recommenders.common import (
     init_mlp_weights_optional_bias,
     set_static_max_seq_lens,
 )
+from generative_recommenders.runtime.device import autocast_device_type, can_use_bf16
 from generative_recommenders.modules.hstu_transducer import HSTUTransducer
 from generative_recommenders.modules.multitask_module import (
     DefaultMultitaskModule,
@@ -333,10 +334,13 @@ class DlrmHSTU(HammerModule):
         dtype = embedding.dtype
         if (not self.is_inference) and self._bf16_training:
             embedding = embedding.to(torch.bfloat16)
+        ac_device_type = autocast_device_type(embedding.device)
         with torch.autocast(
-            "cuda",
+            ac_device_type,
             dtype=torch.bfloat16,
-            enabled=(not self.is_inference) and self._bf16_training,
+            enabled=(not self.is_inference)
+            and self._bf16_training
+            and can_use_bf16(embedding.device),
         ):
             candidates_user_embeddings, _ = self._hstu_transducer(
                 max_uih_len=max_uih_len,

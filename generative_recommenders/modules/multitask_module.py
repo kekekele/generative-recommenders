@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from generative_recommenders.common import HammerModule
+from generative_recommenders.runtime.device import autocast_device_type, can_use_bf16
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -216,11 +217,14 @@ class DefaultMultitaskModule(MultitaskModule):
         if not self._is_inference:
             encoded_user_embeddings = encoded_user_embeddings.to(self._training_dtype)
             item_embeddings = item_embeddings.to(self._training_dtype)
+        ac_device_type = autocast_device_type(encoded_user_embeddings.device)
 
         with torch.autocast(
-            "cuda",
+            ac_device_type,
             dtype=torch.bfloat16,
-            enabled=(not self.is_inference and self._training_dtype == torch.bfloat16),
+            enabled=(not self.is_inference)
+            and (self._training_dtype == torch.bfloat16)
+            and can_use_bf16(encoded_user_embeddings.device),
         ):
             mt_preds, mt_logits = _compute_pred_and_logits(
                 prediction_module=self._prediction_module,
