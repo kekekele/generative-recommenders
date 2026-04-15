@@ -11,156 +11,204 @@
 
 ## 文件 1: generative_recommenders/research/data/preprocessor.py
 
-## 1) 输入 schema 归一化
+## 1) 插入点总览（精确落位）
 
 ### Before
 
-- 默认假设是公开实验格式：
-  - `user_id`
-  - `sequence_item_ids`
-  - `sequence_ratings`
-  - `sequence_timestamps`
-- 不识别：
-  - `UserId`
-  - `sequence_UTCTimeOffset`
+- 当前 `preprocessor.py` 没有 geo side-info 输出，也没有样例 schema 兼容逻辑。
 
 ### After (伪补丁)
 
-增加一个序列 schema 归一化步骤：
+文件 1 建议拆成 5 个插入点：
+
+1. 在 `DataProcessor.output_format_csv()` 后新增通用路径方法。
+2. 在 `DataProcessor.to_seq_data()` 后新增通用归一化辅助函数。
+3. 在 `MovielensDataProcessor.preprocess_rating()` 的 `seq_ratings_data = self.to_seq_data(...)` 之前插入序列归一化。
+4. 在 `MovielensDataProcessor.preprocess_rating()` 的序列构建阶段插入 geo 文件生成。
+5. 在 `AmazonDataProcessor.preprocess_rating()` 按相同模式插入序列归一化与 geo 文件生成。
+
+---
+
+## 2) 插入点 A：`DataProcessor` 通用路径方法
+
+### 位置
+
+- 放在 `output_format_csv()` 之后、`to_seq_data()` 之前。
+
+### After (伪补丁)
 
 ```python
-if "UserId" in seq_df.columns:
-    seq_df = seq_df.rename(columns={"UserId": "user_id"})
-
-if "sequence_UTCTimeOffset" in seq_df.columns:
-    seq_df = seq_df.rename(
-        columns={"sequence_UTCTimeOffset": "sequence_timestamps"}
-    )
+def output_item_geo_features_csv(self) -> str:
+    return f"tmp/processed/{self._prefix}/item_geo_features.csv"
 ```
 
-并统一解析：
+说明：
+
+- 统一 geo 输出路径，避免在各子类里写死。
+
+---
+
+## 3) 插入点 B：`DataProcessor` 通用辅助函数
+
+### 位置
+
+- 放在 `to_seq_data()` 之后、`file_exists()` 之前。
+
+### After (伪补丁)
 
 ```python
-seq_df["sequence_item_ids"] = seq_df["sequence_item_ids"].apply(eval)
-seq_df["sequence_timestamps"] = seq_df["sequence_timestamps"].apply(eval)
+def _normalize_custom_sequence_schema(self, seq_df: pd.DataFrame) -> pd.DataFrame:
+    if "UserId" in seq_df.columns:
+        seq_df = seq_df.rename(columns={"UserId": "user_id"})
+    if "sequence_UTCTimeOffset" in seq_df.columns:
+        seq_df = seq_df.rename(columns={"sequence_UTCTimeOffset": "sequence_timestamps"})
 
-if "sequence_ratings" not in seq_df.columns:
-    seq_df["sequence_ratings"] = seq_df["sequence_item_ids"].apply(
-        lambda seq: [1 for _ in seq]
+    seq_df["sequence_item_ids"] = seq_df["sequence_item_ids"].apply(eval)
+    seq_df["sequence_timestamps"] = seq_df["sequence_timestamps"].apply(eval)
+
+    if "sequence_ratings" not in seq_df.columns:
+        seq_df["sequence_ratings"] = seq_df["sequence_item_ids"].apply(
+            lambda seq: [1 for _ in seq]
+        )
+    else:
+        seq_df["sequence_ratings"] = seq_df["sequence_ratings"].apply(eval)
+
+    seq_df["sequence_timestamps"] = seq_df["sequence_timestamps"].apply(
+        lambda seq: [int(pd.Timestamp(x).timestamp()) for x in seq]
     )
-else:
-    seq_df["sequence_ratings"] = seq_df["sequence_ratings"].apply(eval)
+
+    for row in seq_df.itertuples():
+        assert len(row.sequence_item_ids) == len(row.sequence_ratings)
+        assert len(row.sequence_item_ids) == len(row.sequence_timestamps)
+
+    return seq_df
+
+
+def _shift_item_ids_for_model(self, seq_df: pd.DataFrame) -> pd.DataFrame:
+    # reserve 0 for padding/unknown
+    seq_df["sequence_item_ids"] = seq_df["sequence_item_ids"].apply(
+        lambda seq: [int(x) + 1 for x in seq]
+    )
+    return seq_df
+
+
+def _build_item_geo_features_df(self, geo_df: pd.DataFrame) -> pd.DataFrame:
+    geo_df = geo_df.copy()
+    geo_df["item_id"] = geo_df["item_id"].astype(int) + 1
+
+    geo_df["geo_cell_l5"] = geo_df.apply(
+        lambda row: geohash_encode(row["Latitude"], row["Longitude"], precision=5)
+        if pd.notna(row["Latitude"]) and pd.notna(row["Longitude"])
+        else "UNK",
+        axis=1,
+    )
+    geo_df["geo_cell_l7"] = geo_df.apply(
+        lambda row: geohash_encode(row["Latitude"], row["Longitude"], precision=7)
+        if pd.notna(row["Latitude"]) and pd.notna(row["Longitude"])
+        else "UNK",
+        axis=1,
+    )
+
+    # fallback without boundary service
+    geo_df["geo_region_id"] = geo_df["geo_cell_l5"]
+
+    for col in ["geo_region_id", "geo_cell_l5", "geo_cell_l7"]:
+        geo_df[col] = pd.Categorical(geo_df[col]).codes + 1
+        geo_df.loc[geo_df[col] < 1, col] = 0
+
+    return geo_df[["item_id", "geo_region_id", "geo_cell_l5", "geo_cell_l7"]]
 ```
 
 ---
 
-## 2) 时间字符串转整型时间戳
+## 4) 插入点 C：`MovielensDataProcessor.preprocess_rating()` 序列归一化
 
-### Before
+### 位置
 
-- 当前默认 `sequence_timestamps` 已经是数值序列
-
-### After (伪补丁)
-
-增加时间转换：
-
-```python
-seq_df["sequence_timestamps"] = seq_df["sequence_timestamps"].apply(
-    lambda seq: [int(pd.Timestamp(x).timestamp()) for x in seq]
-)
-```
-
-并增加长度校验：
-
-```python
-for row in seq_df.itertuples():
-    assert len(row.sequence_item_ids) == len(row.sequence_ratings)
-    assert len(row.sequence_item_ids) == len(row.sequence_timestamps)
-```
-
----
-
-## 3) 业务 item id 与 padding id 冲突修正
-
-### Before
-
-- 当前召回模型保留 `0` 作为 padding id
-- 你的样例里真实 item 可能从 `0` 开始
+- 在 `seq_ratings_data = self.to_seq_data(seq_ratings_data, users)` 之前插入。
 
 ### After (伪补丁)
 
-增加模型 id 偏移：
-
 ```python
-seq_df["sequence_item_ids"] = seq_df["sequence_item_ids"].apply(
-    lambda seq: [int(x) + 1 for x in seq]
+seq_ratings_data = self.to_seq_data(seq_ratings_data, users)
+
+# optional custom schema normalization for external sequence sources
+seq_ratings_data = self._normalize_custom_sequence_schema(seq_ratings_data)
+seq_ratings_data = self._shift_item_ids_for_model(seq_ratings_data)
+
+seq_ratings_data.sample(frac=1).reset_index().to_csv(
+    self.output_format_csv(), index=False, sep="," 
 )
 ```
 
 说明：
 
-- `0` 留给 padding
-- 所有真实 item 使用 `raw_item_id + 1`
+- 如果你继续用 MovieLens 原始公开数据，这两步可以由开关控制。
+- 如果你替换成你的样例输入，这两步应开启。
 
 ---
 
-## 4) item geo 特征文件生成
+## 5) 插入点 D：`MovielensDataProcessor.preprocess_rating()` geo 文件生成
 
-### Before
+### 位置
 
-- 无 `item_geo_features.csv`
-- 原 geo 文件仅包含：
-  - `item_id`
-  - `Latitude`
-  - `Longitude`
-  - 以及一些原始业务字段
+- 放在 seq 输出之前（建议在 `ratings_group = ...groupby(...)` 前后）。
 
 ### After (伪补丁)
 
-新增一段 geo side-info 处理逻辑：
-
 ```python
-geo_df = pd.read_csv(geo_csv)
-geo_df["item_id"] = geo_df["item_id"].astype(int) + 1
+if geo_csv_path is not None and os.path.exists(geo_csv_path):
+    geo_df = pd.read_csv(geo_csv_path)
+    item_geo_df = self._build_item_geo_features_df(geo_df)
+    item_geo_df.to_csv(self.output_item_geo_features_csv(), index=False)
 ```
 
-生成离散 geo 特征：
+说明：
+
+- 这个输出和 `sasrec_format.csv` 同批次产出。
+
+---
+
+## 6) 插入点 E：`AmazonDataProcessor.preprocess_rating()` 对齐同样逻辑
+
+### 位置
+
+- 在 `seq_ratings_data = self.to_seq_data(seq_ratings_data)` 之前和之后，按 Movielens 同样结构插入。
+
+### After (伪补丁)
 
 ```python
-geo_df["geo_cell_l5"] = geo_df.apply(
-    lambda row: geohash_encode(row["Latitude"], row["Longitude"], precision=5)
-    if pd.notna(row["Latitude"]) and pd.notna(row["Longitude"])
-    else "UNK",
-    axis=1,
+seq_ratings_data = self.to_seq_data(seq_ratings_data)
+seq_ratings_data = self._normalize_custom_sequence_schema(seq_ratings_data)
+seq_ratings_data = self._shift_item_ids_for_model(seq_ratings_data)
+
+seq_ratings_data.sample(frac=1).reset_index().to_csv(
+    self.output_format_csv(), index=False, sep="," 
 )
 
-geo_df["geo_cell_l7"] = geo_df.apply(
-    lambda row: geohash_encode(row["Latitude"], row["Longitude"], precision=7)
-    if pd.notna(row["Latitude"]) and pd.notna(row["Longitude"])
-    else "UNK",
-    axis=1,
-)
-
-# 无行政区底图时，region 直接回退为 coarse cell
-geo_df["geo_region_id"] = geo_df["geo_cell_l5"]
+if geo_csv_path is not None and os.path.exists(geo_csv_path):
+    geo_df = pd.read_csv(geo_csv_path)
+    item_geo_df = self._build_item_geo_features_df(geo_df)
+    item_geo_df.to_csv(self.output_item_geo_features_csv(), index=False)
 ```
 
-再做 category 编码：
+---
 
-```python
-for col in ["geo_region_id", "geo_cell_l5", "geo_cell_l7"]:
-    geo_df[col] = pd.Categorical(geo_df[col]).codes + 1
-    geo_df.loc[geo_df[col] < 1, col] = 0
-```
+## 7) 文件 1 最小验收
 
-输出：
-
-```python
-geo_df[["item_id", "geo_region_id", "geo_cell_l5", "geo_cell_l7"]].to_csv(
-    f"tmp/processed/{dataset_name}/item_geo_features.csv",
-    index=False,
-)
-```
+1. `sasrec_format.csv` 有且仅有训练所需列：
+   - `user_id`
+   - `sequence_item_ids`
+   - `sequence_ratings`
+   - `sequence_timestamps`
+2. 所有 `sequence_item_ids` 的最小值 `>= 1`。
+3. `item_geo_features.csv` 存在，字段为：
+   - `item_id`
+   - `geo_region_id`
+   - `geo_cell_l5`
+   - `geo_cell_l7`
+4. `item_geo_features.csv` 中 `item_id` 最小值 `>= 1`。
+5. 序列长度一致性断言不触发。
 
 ---
 
