@@ -467,8 +467,46 @@ def make_optimizer_and_shard(
     if accelerator != "cuda":
         _materialize_meta_embeddings(model)
         model = model.to(device)
-        dense_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = dense_opt_factory(dense_params)
+        sparse_param_names: Set[str] = set()
+        for module_name, module in model.named_modules():
+            if type(module) in TORCHREC_TYPES:
+                for param_name, param in module.named_parameters(prefix=module_name):
+                    if param.requires_grad:
+                        sparse_param_names.add(param_name)
+
+        dense_params: Dict[str, torch.Tensor] = {}
+        sparse_params: Dict[str, torch.Tensor] = {}
+        for param_name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param_name in sparse_param_names:
+                sparse_params[param_name] = param
+            else:
+                dense_params[param_name] = param
+
+        all_optimizers = []
+        if sparse_params:
+            all_optimizers.append(
+                (
+                    "sparse",
+                    KeyedOptimizerWrapper(
+                        params=sparse_params,
+                        optim_factory=sparse_opt_factory,
+                    ),
+                )
+            )
+        if dense_params:
+            all_optimizers.append(
+                (
+                    "dense",
+                    KeyedOptimizerWrapper(
+                        params=dense_params,
+                        optim_factory=dense_opt_factory,
+                    ),
+                )
+            )
+
+        optimizer = CombinedOptimizer(all_optimizers)
         return model, optimizer  # pyre-ignore [7]
 
     # Fuse sparse optimizer to backward step
