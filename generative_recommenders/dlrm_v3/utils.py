@@ -51,6 +51,39 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("utils")
 
 
+def _binary_auc(
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    weights: torch.Tensor,
+) -> float:
+    # Weighted ROC-AUC for binary labels. Samples with non-positive weights are ignored.
+    valid = weights > 0
+    if valid.sum().item() == 0:
+        return float("nan")
+
+    y_score = predictions[valid].to(torch.float32)
+    y_true = labels[valid].to(torch.float32)
+    w = weights[valid].to(torch.float32)
+
+    pos_w = (w * y_true).sum()
+    neg_w = (w * (1.0 - y_true)).sum()
+    if pos_w <= 0 or neg_w <= 0:
+        return float("nan")
+
+    order = torch.argsort(y_score, descending=True)
+    y_true = y_true[order]
+    w = w[order]
+
+    tpr = torch.cumsum(w * y_true, dim=0) / pos_w
+    fpr = torch.cumsum(w * (1.0 - y_true), dim=0) / neg_w
+
+    zero = torch.zeros(1, dtype=tpr.dtype, device=tpr.device)
+    tpr = torch.cat([zero, tpr], dim=0)
+    fpr = torch.cat([zero, fpr], dim=0)
+    auc = torch.trapz(tpr, fpr)
+    return float(auc.item())
+
+
 def _on_trace_ready_fn(
     rank: Optional[int] = None,
 ) -> Callable[[torch.profiler.profile], None]:
@@ -149,7 +182,7 @@ class MetricsLogger:
     """
     Logger for tracking and computing recommendation metrics.
 
-    Supports both classification metrics (NE, Accuracy, GAUC) and regression
+    Supports both classification metrics (NE, Accuracy, GAUC, AUC) and regression
     metrics (MSE, MAE) based on multitask configuration.
 
     Args:
@@ -176,6 +209,7 @@ class MetricsLogger:
             for task in self.multitask_configs
             if task.task_type != MultitaskTaskType.REGRESSION
         ]
+        self.classification_task_names: List[str] = all_classification_tasks
         all_regression_tasks: List[str] = [
             task.task_name
             for task in self.multitask_configs
@@ -241,6 +275,11 @@ class MetricsLogger:
                 )
 
         self.global_step: Dict[str, int] = {"train": 0, "eval": 0}
+        # Store batch-wise tensors for AUC aggregation by mode.
+        self._auc_storage: Dict[str, Dict[str, List[torch.Tensor]]] = {
+            "train": {"predictions": [], "labels": [], "weights": []},
+            "eval": {"predictions": [], "labels": [], "weights": []},
+        }
         self.tb_logger: Optional[SummaryWriter] = None
         if tensorboard_log_path != "":
             self.tb_logger = SummaryWriter(log_dir=tensorboard_log_path, purge_step=0)
@@ -291,6 +330,11 @@ class MetricsLogger:
                     labels=labels,
                     weights=weights,
                 )
+
+        if self.class_metrics[mode]:
+            self._auc_storage[mode]["predictions"].append(predictions.detach().cpu())
+            self._auc_storage[mode]["labels"].append(labels.detach().cpu())
+            self._auc_storage[mode]["weights"].append(weights.detach().cpu())
         self.global_step[mode] += 1
 
     def compute(self, mode: str = "train") -> Dict[str, float]:
@@ -313,9 +357,51 @@ class MetricsLogger:
                     key = f"metric/{str(computed.metric_prefix) + str(computed.name)}/{task_name}"
                     all_computed_metrics[key] = all_values[i]
 
+        if self.class_metrics[mode] and self._auc_storage[mode]["predictions"]:
+            preds = torch.cat(self._auc_storage[mode]["predictions"], dim=1)
+            labels = torch.cat(self._auc_storage[mode]["labels"], dim=1)
+            weights = torch.cat(self._auc_storage[mode]["weights"], dim=1)
+            num_classification_tasks = len(
+                [
+                    task
+                    for task in self.multitask_configs
+                    if task.task_type != MultitaskTaskType.REGRESSION
+                ]
+            )
+            for i in range(num_classification_tasks):
+                key = f"metric/auc/{self.task_names[i]}"
+                all_computed_metrics[key] = _binary_auc(
+                    predictions=preds[i],
+                    labels=labels[i],
+                    weights=weights[i],
+                )
+
         logger.info(
             f"{mode} - Step {self.global_step[mode]} metrics: {all_computed_metrics}"
         )
+        if self.classification_task_names:
+            summary_items: List[str] = []
+            for task_name in self.classification_task_names:
+                auc_value = all_computed_metrics.get(f"metric/auc/{task_name}", float("nan"))
+                gauc_value = float("nan")
+                for metric_name, metric_value in all_computed_metrics.items():
+                    lower_name = metric_name.lower()
+                    if "gauc" in lower_name and lower_name.endswith(f"/{task_name}"):
+                        gauc_value = float(metric_value)
+                        break
+
+                def _fmt(v: float) -> str:
+                    if v != v:
+                        return "nan"
+                    return f"{v:.6f}"
+
+                summary_items.append(
+                    f"{task_name}:AUC={_fmt(float(auc_value))},GAUC={_fmt(gauc_value)}"
+                )
+            logger.info(
+                f"{mode} - Step {self.global_step[mode]} AUC/GAUC summary: "
+                + " | ".join(summary_items)
+            )
         return all_computed_metrics
 
     def compute_and_log(
@@ -364,6 +450,9 @@ class MetricsLogger:
         """
         for metric in self.all_metrics[mode]:
             metric.reset()
+        self._auc_storage[mode]["predictions"] = []
+        self._auc_storage[mode]["labels"] = []
+        self._auc_storage[mode]["weights"] = []
 
 
 # the datasets we support
