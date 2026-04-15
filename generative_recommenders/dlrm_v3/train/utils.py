@@ -336,6 +336,9 @@ def make_model(
     ranking_prediction_head_act_type: str = "relu",
     ranking_prediction_head_bias: bool = True,
 ) -> Tuple[torch.nn.Module, DlrmHSTUConfig, Dict[str, EmbeddingConfig]]:
+    logger.info(
+        f"make_model dataset={dataset} model_variant={model_variant} bf16_training={bf16_training}"
+    )
     hstu_config = get_hstu_configs(dataset)
     table_config = get_embedding_table_config(dataset)
 
@@ -631,6 +634,7 @@ def train_loop(
     output_trace: bool = False,
     metric_log_frequency: int = 1,
     checkpoint_frequency: int = 100,
+    max_grad_norm: Optional[float] = None,
     start_batch_idx: int = 0,
     # lr_scheduler: to-do: Add a scheduler
 ) -> None:
@@ -674,6 +678,17 @@ def train_loop(
                 mt_target_labels=mt_target_labels,
                 mt_target_weights=mt_target_weights,
             )
+            if max_grad_norm is not None and max_grad_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=max_grad_norm
+                )
+                if not torch.isfinite(grad_norm):
+                    logger.error(
+                        f"[train_loop] non-finite grad_norm={float(grad_norm):.6f} "
+                        f"at step={batch_idx}; skipping optimizer step"
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
             if _has_nonfinite_grads(model):
                 logger.error(
                     f"[train_loop] non-finite gradients at step={batch_idx}; skipping optimizer step"
@@ -783,6 +798,7 @@ def train_eval_loop(
     metric_log_frequency: int = 1,
     checkpoint_frequency: int = 100,
     eval_frequency: int = 1,
+    max_grad_norm: Optional[float] = None,
     start_train_batch_idx: int = 0,
     start_eval_batch_idx: int = 0,
     # lr_scheduler: to-do: Add a scheduler
@@ -838,6 +854,17 @@ def train_eval_loop(
                 mt_target_labels=mt_target_labels,
                 mt_target_weights=mt_target_weights,
             )
+            if max_grad_norm is not None and max_grad_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=max_grad_norm
+                )
+                if not torch.isfinite(grad_norm):
+                    logger.error(
+                        f"[train_eval_loop] non-finite grad_norm={float(grad_norm):.6f} "
+                        f"at step={train_batch_idx}; skipping optimizer step"
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
             if _has_nonfinite_grads(model):
                 logger.error(
                     f"[train_eval_loop] non-finite gradients at step={train_batch_idx}; skipping optimizer step"
@@ -938,6 +965,7 @@ def streaming_train_eval_loop(
     output_trace: bool = False,
     metric_log_frequency: int = 1,
     checkpoint_frequency: int = 100,
+    max_grad_norm: Optional[float] = None,
 ) -> None:
     profiler = Profiler(rank, active=10) if output_trace else None
     dataset_class, kwargs = get_dataset()
@@ -988,6 +1016,17 @@ def streaming_train_eval_loop(
                 mt_target_labels=mt_target_labels,
                 mt_target_weights=mt_target_weights,
             )
+            if max_grad_norm is not None and max_grad_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=max_grad_norm
+                )
+                if not torch.isfinite(grad_norm):
+                    logger.error(
+                        f"[streaming_train_eval_loop] non-finite grad_norm={float(grad_norm):.6f} "
+                        f"at step={train_batch_idx}; skipping optimizer step"
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
             if _has_nonfinite_grads(model):
                 logger.error(
                     f"[streaming_train_eval_loop] non-finite gradients at step={train_batch_idx}; skipping optimizer step"
