@@ -219,6 +219,17 @@ def _run_backward_with_oom_logging(
         raise
 
 
+def _all_aux_losses_finite(aux_losses: Dict[str, torch.Tensor]) -> bool:
+    return all(torch.isfinite(v).all().item() for v in aux_losses.values())
+
+
+def _has_nonfinite_grads(model: torch.nn.Module) -> bool:
+    for p in model.parameters():
+        if p.grad is not None and (not torch.isfinite(p.grad).all()):
+            return True
+    return False
+
+
 def setup(
     rank: int,
     world_size: int,
@@ -320,6 +331,7 @@ class ChunkDistributedSampler(DistributedSampler[_T_co]):
 def make_model(
     dataset: str,
     model_variant: str = "dlrm_hstu",
+    bf16_training: bool = True,
     ranking_prediction_head_arch: Tuple[int, ...] = (512, 1),
     ranking_prediction_head_act_type: str = "relu",
     ranking_prediction_head_bias: bool = True,
@@ -332,12 +344,14 @@ def make_model(
             hstu_configs=hstu_config,
             embedding_tables=table_config,
             is_inference=False,
+            bf16_training=bf16_training,
         )
     elif model_variant == "ranking_gr_adapter":
         model = RankingGRAdapter(
             hstu_configs=hstu_config,
             embedding_tables=table_config,
             is_inference=False,
+            bf16_training=bf16_training,
             ranking_config=RankingAdapterConfig(
                 prediction_head_arch=ranking_prediction_head_arch,
                 prediction_head_act_type=ranking_prediction_head_act_type,
@@ -640,6 +654,16 @@ def train_loop(
                 sample.uih_features_kjt,
                 sample.candidates_features_kjt,
             )
+            if not _all_aux_losses_finite(aux_losses):
+                logger.error(
+                    f"[train_loop] non-finite aux_losses at step={batch_idx}; skipping optimizer step"
+                )
+                for loss_name, loss_value in aux_losses.items():
+                    logger.error(
+                        f"[train_loop] aux_loss {loss_name} finite_ratio="
+                        f"{float(torch.isfinite(loss_value).float().mean().item()):.6f}"
+                    )
+                continue
             _run_backward_with_oom_logging(
                 loop_name="train_loop",
                 step_idx=batch_idx,
@@ -650,6 +674,12 @@ def train_loop(
                 mt_target_labels=mt_target_labels,
                 mt_target_weights=mt_target_weights,
             )
+            if _has_nonfinite_grads(model):
+                logger.error(
+                    f"[train_loop] non-finite gradients at step={batch_idx}; skipping optimizer step"
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
             optimizer.step()
             metric_logger.update(
                 mode="train",
@@ -788,6 +818,16 @@ def train_eval_loop(
                 sample.uih_features_kjt,
                 sample.candidates_features_kjt,
             )
+            if not _all_aux_losses_finite(aux_losses):
+                logger.error(
+                    f"[train_eval_loop] non-finite aux_losses at step={train_batch_idx}; skipping optimizer step"
+                )
+                for loss_name, loss_value in aux_losses.items():
+                    logger.error(
+                        f"[train_eval_loop] aux_loss {loss_name} finite_ratio="
+                        f"{float(torch.isfinite(loss_value).float().mean().item()):.6f}"
+                    )
+                continue
             _run_backward_with_oom_logging(
                 loop_name="train_eval_loop",
                 step_idx=train_batch_idx,
@@ -798,6 +838,12 @@ def train_eval_loop(
                 mt_target_labels=mt_target_labels,
                 mt_target_weights=mt_target_weights,
             )
+            if _has_nonfinite_grads(model):
+                logger.error(
+                    f"[train_eval_loop] non-finite gradients at step={train_batch_idx}; skipping optimizer step"
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
             optimizer.step()
             metric_logger.update(
                 mode="train",
@@ -922,6 +968,16 @@ def streaming_train_eval_loop(
                 sample.uih_features_kjt,
                 sample.candidates_features_kjt,
             )
+            if not _all_aux_losses_finite(aux_losses):
+                logger.error(
+                    f"[streaming_train_eval_loop] non-finite aux_losses at step={train_batch_idx}; skipping optimizer step"
+                )
+                for loss_name, loss_value in aux_losses.items():
+                    logger.error(
+                        f"[streaming_train_eval_loop] aux_loss {loss_name} finite_ratio="
+                        f"{float(torch.isfinite(loss_value).float().mean().item()):.6f}"
+                    )
+                continue
             _run_backward_with_oom_logging(
                 loop_name="streaming_train_eval_loop",
                 step_idx=train_batch_idx,
@@ -932,6 +988,12 @@ def streaming_train_eval_loop(
                 mt_target_labels=mt_target_labels,
                 mt_target_weights=mt_target_weights,
             )
+            if _has_nonfinite_grads(model):
+                logger.error(
+                    f"[streaming_train_eval_loop] non-finite gradients at step={train_batch_idx}; skipping optimizer step"
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
             optimizer.step()
             metric_logger.update(
                 mode="train",
