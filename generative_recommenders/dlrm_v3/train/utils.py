@@ -830,6 +830,7 @@ def train_eval_loop(
             if train_batch_idx % eval_frequency == 0:
                 model.eval()
                 eval_batch_idx: int = 0
+                metric_logger.reset(mode="eval")
                 with torch.no_grad():
                     while True:
                         try:

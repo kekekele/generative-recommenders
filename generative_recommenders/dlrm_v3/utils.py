@@ -84,6 +84,25 @@ def _binary_auc(
     return float(auc.item())
 
 
+def _summarize_tensor_for_metrics(name: str, x: torch.Tensor) -> str:
+    x32 = x.detach().to(torch.float32)
+    finite = torch.isfinite(x32)
+    finite_ratio = float(finite.float().mean().item()) if x32.numel() > 0 else 1.0
+    if finite.any():
+        finite_vals = x32[finite]
+        min_v = float(finite_vals.min().item())
+        max_v = float(finite_vals.max().item())
+        mean_v = float(finite_vals.mean().item())
+    else:
+        min_v = float("nan")
+        max_v = float("nan")
+        mean_v = float("nan")
+    return (
+        f"{name}: shape={tuple(x.shape)} finite_ratio={finite_ratio:.6f} "
+        f"min={min_v:.6f} max={max_v:.6f} mean={mean_v:.6f}"
+    )
+
+
 def _on_trace_ready_fn(
     rank: Optional[int] = None,
 ) -> Callable[[torch.profiler.profile], None]:
@@ -316,6 +335,31 @@ class MetricsLogger:
             num_candidates: Number of candidates per sample (for GAUC).
             mode: Either 'train' or 'eval'.
         """
+        if self.class_metrics[mode]:
+            preds32 = predictions.detach().to(torch.float32)
+            labels32 = labels.detach().to(torch.float32)
+            weights32 = weights.detach().to(torch.float32)
+
+            has_nonfinite = (
+                (not torch.isfinite(preds32).all())
+                or (not torch.isfinite(labels32).all())
+                or (not torch.isfinite(weights32).all())
+            )
+            out_of_range = bool(((preds32 < 0.0) | (preds32 > 1.0)).any().item())
+            sat_zero = float((preds32 <= 1e-12).float().mean().item())
+            sat_one = float((preds32 >= 1.0 - 1e-12).float().mean().item())
+            zero_weight_ratio = float((weights32 <= 0).float().mean().item())
+
+            if has_nonfinite or out_of_range or sat_zero > 0 or sat_one > 0:
+                logger.warning(
+                    f"{mode} - metric input anomaly detected: "
+                    f"pred_out_of_range={out_of_range} sat_zero={sat_zero:.6f} "
+                    f"sat_one={sat_one:.6f} zero_weight_ratio={zero_weight_ratio:.6f}"
+                )
+                logger.warning(_summarize_tensor_for_metrics("predictions", predictions))
+                logger.warning(_summarize_tensor_for_metrics("labels", labels))
+                logger.warning(_summarize_tensor_for_metrics("weights", weights))
+
         for metric in self.all_metrics[mode]:
             if isinstance(metric, GAUCMetricComputation):
                 metric.update(
