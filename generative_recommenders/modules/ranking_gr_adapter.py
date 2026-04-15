@@ -1,6 +1,7 @@
 # pyre-strict
 
 from dataclasses import dataclass
+import logging
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -10,6 +11,26 @@ from generative_recommenders.modules.dlrm_hstu import DlrmHSTU, DlrmHSTUConfig
 from generative_recommenders.modules.multitask_module import MultitaskTaskType
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+
+logger = logging.getLogger(__name__)
+
+
+def _finite_ratio(x: torch.Tensor) -> float:
+    return float(torch.isfinite(x.detach()).float().mean().item())
+
+
+def _tensor_summary(name: str, x: torch.Tensor) -> str:
+    x32 = x.detach().to(torch.float32)
+    finite = torch.isfinite(x32)
+    if finite.any():
+        vals = x32[finite]
+        return (
+            f"{name}: shape={tuple(x.shape)} finite_ratio={_finite_ratio(x):.6f} "
+            f"min={float(vals.min().item()):.6f} max={float(vals.max().item()):.6f} "
+            f"mean={float(vals.mean().item()):.6f}"
+        )
+    return f"{name}: shape={tuple(x.shape)} finite_ratio=0.000000 min=nan max=nan mean=nan"
 
 
 def _build_mlp(
@@ -131,6 +152,20 @@ class RankingGRAdapter(torch.nn.Module):
 
         logits = self._ranking_head(candidates_user_embeddings).transpose(0, 1)
         predictions = torch.sigmoid(logits)
+
+        if not torch.isfinite(candidates_user_embeddings).all():
+            logger.warning("ranking_gr_adapter non-finite backbone embeddings detected")
+            logger.warning(_tensor_summary("candidates_user_embeddings", candidates_user_embeddings))
+        if not torch.isfinite(logits).all():
+            logger.warning("ranking_gr_adapter non-finite logits detected")
+            logger.warning(_tensor_summary("logits", logits))
+            for name, param in self._ranking_head.named_parameters():
+                if not torch.isfinite(param).all():
+                    logger.warning(f"ranking_gr_adapter non-finite head param: {name}")
+                    logger.warning(_tensor_summary(f"param:{name}", param))
+        if not torch.isfinite(predictions).all():
+            logger.warning("ranking_gr_adapter non-finite predictions detected")
+            logger.warning(_tensor_summary("predictions", predictions))
 
         aux_losses: Dict[str, torch.Tensor] = {}
         if not self._is_inference and mt_target_labels is not None:
