@@ -64,6 +64,9 @@ class DataProcessor:
     def output_item_geo_features_csv(self) -> str:
         return f"tmp/processed/{self._prefix}/item_geo_features.csv"
 
+    def output_item_geo_fourier_features_csv(self) -> str:
+        return f"tmp/processed/{self._prefix}/item_geo_fourier_features.csv"
+
     def to_seq_data(
         self,
         ratings_data: pd.DataFrame,
@@ -192,6 +195,26 @@ class DataProcessor:
 
         return geo_df[["item_id", "geo_region_id", "geo_cell_l5", "geo_cell_l7"]]
 
+    def _build_item_geo_fourier_features_df(
+        self,
+        geo_df: pd.DataFrame,
+        item_id_offset: int,
+    ) -> pd.DataFrame:
+        geo_df = geo_df.copy()
+
+        for col in ["item_id", "Latitude", "Longitude"]:
+            if col not in geo_df.columns:
+                raise ValueError(f"Missing required column '{col}' in geo csv")
+
+        geo_df["item_id"] = geo_df["item_id"].astype(int) + item_id_offset
+        lat = geo_df["Latitude"].astype(float)
+        lon = geo_df["Longitude"].astype(float)
+
+        # Keep Fourier inputs separated from discrete geo ids.
+        geo_df["lat_norm"] = (lat / 90.0).clip(-1.0, 1.0)
+        geo_df["lon_norm"] = (lon / 180.0).clip(-1.0, 1.0)
+        return geo_df[["item_id", "lat_norm", "lon_norm"]]
+
     def file_exists(self, name: str) -> bool:
         return os.path.isfile("%s/%s" % (os.getcwd(), name))
 
@@ -272,6 +295,15 @@ class CustomSequenceDataProcessor(DataProcessor):
                 item_id_offset=self._item_id_offset,
             )
             item_geo_df.to_csv(self.output_item_geo_features_csv(), index=False)
+
+            item_geo_fourier_df = self._build_item_geo_fourier_features_df(
+                geo_df=geo_df,
+                item_id_offset=self._item_id_offset,
+            )
+            item_geo_fourier_df.to_csv(
+                self.output_item_geo_fourier_features_csv(),
+                index=False,
+            )
 
         all_item_ids = [
             item_id for seq in seq_df["sequence_item_ids"].tolist() for item_id in seq

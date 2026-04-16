@@ -42,6 +42,8 @@ class RecoDataset:
     item_geo_region_ids: torch.Tensor
     item_geo_cell_l5_ids: torch.Tensor
     item_geo_cell_l7_ids: torch.Tensor
+    item_geo_lat_norm: torch.Tensor
+    item_geo_lon_norm: torch.Tensor
 
 
 def _get_item_geo_features_csv_candidates(dataset_name: str) -> List[str]:
@@ -49,6 +51,13 @@ def _get_item_geo_features_csv_candidates(dataset_name: str) -> List[str]:
     return [
         f"tmp/processed/{dataset_name}/item_geo_features.csv",
         f"tmp/processed/{dataset_name.replace('-', '_')}/item_geo_features.csv",
+    ]
+
+
+def _get_item_geo_fourier_features_csv_candidates(dataset_name: str) -> List[str]:
+    return [
+        f"tmp/processed/{dataset_name}/item_geo_fourier_features.csv",
+        f"tmp/processed/{dataset_name.replace('-', '_')}/item_geo_fourier_features.csv",
     ]
 
 
@@ -90,6 +99,44 @@ def _load_item_geo_tensors(
         item_geo_cell_l7_ids[item_id] = int(getattr(row, "geo_cell_l7"))
 
     return [item_geo_region_ids, item_geo_cell_l5_ids, item_geo_cell_l7_ids]
+
+
+def _load_item_geo_fourier_tensors(
+    dataset_name: str,
+    max_item_id: int,
+) -> List[torch.Tensor]:
+    item_geo_lat_norm = torch.zeros((max_item_id + 1,), dtype=torch.float32)
+    item_geo_lon_norm = torch.zeros((max_item_id + 1,), dtype=torch.float32)
+
+    geo_csv = None
+    for candidate in _get_item_geo_fourier_features_csv_candidates(dataset_name):
+        if os.path.exists(candidate):
+            geo_csv = candidate
+            break
+
+    if geo_csv is None:
+        print(
+            f"[reco_dataset] item_geo_fourier_features.csv not found for {dataset_name}; "
+            "falling back to all-zero Fourier geo features"
+        )
+        return [item_geo_lat_norm, item_geo_lon_norm]
+
+    geo_df = pd.read_csv(geo_csv)
+    required_cols = ["item_id", "lat_norm", "lon_norm"]
+    for col in required_cols:
+        if col not in geo_df.columns:
+            raise ValueError(
+                f"{geo_csv} missing required column {col}; found {list(geo_df.columns)}"
+            )
+
+    for row in geo_df.itertuples(index=False):
+        item_id = int(getattr(row, "item_id"))
+        if item_id < 0 or item_id > max_item_id:
+            continue
+        item_geo_lat_norm[item_id] = float(getattr(row, "lat_norm"))
+        item_geo_lon_norm[item_id] = float(getattr(row, "lon_norm"))
+
+    return [item_geo_lat_norm, item_geo_lon_norm]
 
 
 def _infer_item_stats_from_sequence_csv(ratings_file: str) -> List[int]:
@@ -287,12 +334,19 @@ def get_reco_dataset(
         max_item_id=max_item_id,  # pyre-ignore [6]
     )
 
+    [item_geo_lat_norm, item_geo_lon_norm] = _load_item_geo_fourier_tensors(
+        dataset_name=dataset_name,
+        max_item_id=max_item_id,  # pyre-ignore [6]
+    )
+
     if len(all_item_ids) > 0:
         assert min(all_item_ids) >= 1, "all_item_ids must reserve 0 for padding"
 
     assert item_geo_region_ids.size(0) == max_item_id + 1  # pyre-ignore [6]
     assert item_geo_cell_l5_ids.size(0) == max_item_id + 1  # pyre-ignore [6]
     assert item_geo_cell_l7_ids.size(0) == max_item_id + 1  # pyre-ignore [6]
+    assert item_geo_lat_norm.size(0) == max_item_id + 1  # pyre-ignore [6]
+    assert item_geo_lon_norm.size(0) == max_item_id + 1  # pyre-ignore [6]
 
     return RecoDataset(
         max_sequence_length=max_sequence_length,
@@ -306,4 +360,6 @@ def get_reco_dataset(
         item_geo_region_ids=item_geo_region_ids,
         item_geo_cell_l5_ids=item_geo_cell_l5_ids,
         item_geo_cell_l7_ids=item_geo_cell_l7_ids,
+        item_geo_lat_norm=item_geo_lat_norm,
+        item_geo_lon_norm=item_geo_lon_norm,
     )

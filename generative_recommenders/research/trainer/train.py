@@ -39,6 +39,7 @@ from generative_recommenders.research.modeling.sequential.autoregressive_losses 
 )
 from generative_recommenders.research.modeling.sequential.embedding_modules import (
     EmbeddingModule,
+    FourierGeoEmbeddingModule,
     GeoAwareEmbeddingModule,
     LocalEmbeddingModule,
 )
@@ -124,6 +125,9 @@ def train_fn(
     partial_eval_num_iters: int = 32,
     embedding_module_type: str = "local",
     item_embedding_dim: int = 240,
+    fourier_num_bands: int = 64,
+    fourier_scale: float = 10.0,
+    fourier_seed: int = 42,
     geo_embedding_dim: int = 16,
     num_geo_regions: int = 4096,
     num_geo_cells_l5: int = 65536,
@@ -184,6 +188,16 @@ def train_fn(
             num_geo_cells_l5=num_geo_cells_l5,
             num_geo_cells_l7=num_geo_cells_l7,
             geo_embedding_dim=geo_embedding_dim,
+        )
+    elif embedding_module_type == "geo_fourier_only":
+        embedding_module = FourierGeoEmbeddingModule(
+            num_items=dataset.max_item_id,
+            item_embedding_dim=item_embedding_dim,
+            item_geo_lat_norm=dataset.item_geo_lat_norm,
+            item_geo_lon_norm=dataset.item_geo_lon_norm,
+            fourier_num_bands=fourier_num_bands,
+            fourier_scale=fourier_scale,
+            fourier_seed=fourier_seed,
         )
     else:
         raise ValueError(f"Unknown embedding_module_type {embedding_module_type}")

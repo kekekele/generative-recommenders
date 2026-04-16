@@ -178,6 +178,82 @@ class GeoAwareEmbeddingModule(EmbeddingModule):
         return self._item_embedding_dim
 
 
+class FourierGeoEmbeddingModule(EmbeddingModule):
+    def __init__(
+        self,
+        num_items: int,
+        item_embedding_dim: int,
+        item_geo_lat_norm: torch.Tensor,
+        item_geo_lon_norm: torch.Tensor,
+        fourier_num_bands: int,
+        fourier_scale: float,
+        fourier_seed: int,
+    ) -> None:
+        super().__init__()
+
+        if fourier_num_bands <= 0:
+            raise ValueError("fourier_num_bands must be > 0")
+
+        self._item_embedding_dim: int = item_embedding_dim
+        self._item_emb: torch.nn.Embedding = torch.nn.Embedding(
+            num_items + 1,
+            item_embedding_dim,
+            padding_idx=0,
+        )
+
+        self.register_buffer("_item_geo_lat_norm", item_geo_lat_norm.float())
+        self.register_buffer("_item_geo_lon_norm", item_geo_lon_norm.float())
+
+        generator = torch.Generator()
+        generator.manual_seed(fourier_seed)
+        # Random Fourier features for 2D inputs [lat_norm, lon_norm].
+        b = torch.randn((2, fourier_num_bands), generator=generator) * fourier_scale
+        self.register_buffer("_fourier_b", b)
+
+        self._geo_proj: torch.nn.Module = torch.nn.Sequential(
+            torch.nn.Linear(
+                in_features=fourier_num_bands * 2,
+                out_features=item_embedding_dim,
+                bias=False,
+            ),
+            torch.nn.LayerNorm(item_embedding_dim),
+        )
+
+        self.reset_params()
+
+    def debug_str(self) -> str:
+        return f"fourier_geo_emb_d{self._item_embedding_dim}"
+
+    def reset_params(self) -> None:
+        truncated_normal(self._item_emb.weight, mean=0.0, std=0.02)
+        for module in self._geo_proj.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+
+    def _safe_lookup(self, item_ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+        max_id = table.size(0) - 1
+        safe_ids = item_ids.clamp(min=0, max=max_id)
+        return table[safe_ids]
+
+    def get_item_embeddings(self, item_ids: torch.Tensor) -> torch.Tensor:
+        item_emb = self._item_emb(item_ids)
+
+        lat = self._safe_lookup(item_ids, self._item_geo_lat_norm)
+        lon = self._safe_lookup(item_ids, self._item_geo_lon_norm)
+        coord = torch.stack([lat, lon], dim=-1)
+
+        phase = 2.0 * torch.pi * torch.matmul(coord, self._fourier_b)
+        fourier_feat = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)
+        geo_delta = self._geo_proj(fourier_feat)
+
+        geo_delta = geo_delta * (item_ids != 0).unsqueeze(-1).to(geo_delta.dtype)
+        return item_emb + geo_delta
+
+    @property
+    def item_embedding_dim(self) -> int:
+        return self._item_embedding_dim
+
+
 class CategoricalEmbeddingModule(EmbeddingModule):
     def __init__(
         self,
