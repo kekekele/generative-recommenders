@@ -183,16 +183,10 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
         self,
         num_items: int,
         item_embedding_dim: int,
-        item_geo_lat_norm: torch.Tensor,
-        item_geo_lon_norm: torch.Tensor,
-        fourier_num_bands: int,
-        fourier_scale: float,
-        fourier_seed: int,
+        item_geo_fourier_features: torch.Tensor,
+        item_visit_time_features: torch.Tensor,
     ) -> None:
         super().__init__()
-
-        if fourier_num_bands <= 0:
-            raise ValueError("fourier_num_bands must be > 0")
 
         self._item_embedding_dim: int = item_embedding_dim
         self._item_emb: torch.nn.Embedding = torch.nn.Embedding(
@@ -201,18 +195,19 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
             padding_idx=0,
         )
 
-        self.register_buffer("_item_geo_lat_norm", item_geo_lat_norm.float())
-        self.register_buffer("_item_geo_lon_norm", item_geo_lon_norm.float())
+        self.register_buffer(
+            "_item_geo_fourier_features",
+            item_geo_fourier_features.float(),
+        )
+        self.register_buffer("_item_visit_time_features", item_visit_time_features.float())
 
-        generator = torch.Generator()
-        generator.manual_seed(fourier_seed)
-        # Random Fourier features for 2D inputs [lat_norm, lon_norm].
-        b = torch.randn((2, fourier_num_bands), generator=generator) * fourier_scale
-        self.register_buffer("_fourier_b", b)
+        if item_geo_fourier_features.dim() != 2:
+            raise ValueError("item_geo_fourier_features must be rank-2 [num_items+1, dim]")
+        fourier_dim = item_geo_fourier_features.size(1)
 
         self._geo_proj: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(
-                in_features=fourier_num_bands * 2,
+                in_features=fourier_dim + 24,
                 out_features=item_embedding_dim,
                 bias=False,
             ),
@@ -238,13 +233,10 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
     def get_item_embeddings(self, item_ids: torch.Tensor) -> torch.Tensor:
         item_emb = self._item_emb(item_ids)
 
-        lat = self._safe_lookup(item_ids, self._item_geo_lat_norm)
-        lon = self._safe_lookup(item_ids, self._item_geo_lon_norm)
-        coord = torch.stack([lat, lon], dim=-1)
-
-        phase = 2.0 * torch.pi * torch.matmul(coord, self._fourier_b)
-        fourier_feat = torch.cat([torch.sin(phase), torch.cos(phase)], dim=-1)
-        geo_delta = self._geo_proj(fourier_feat)
+        fourier_feat = self._safe_lookup(item_ids, self._item_geo_fourier_features)
+        visit_time_feat = self._safe_lookup(item_ids, self._item_visit_time_features)
+        full_geo_feat = torch.cat([fourier_feat, visit_time_feat], dim=-1)
+        geo_delta = self._geo_proj(full_geo_feat)
 
         geo_delta = geo_delta * (item_ids != 0).unsqueeze(-1).to(geo_delta.dtype)
         return item_emb + geo_delta

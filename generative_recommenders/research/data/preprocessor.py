@@ -15,7 +15,9 @@
 # pyre-unsafe
 
 import abc
+import json
 import logging
+import math
 import os
 import sys
 import tarfile
@@ -66,6 +68,9 @@ class DataProcessor:
 
     def output_item_geo_fourier_features_csv(self) -> str:
         return f"tmp/processed/{self._prefix}/item_geo_fourier_features.csv"
+
+    def output_item_visit_time_features_csv(self) -> str:
+        return f"tmp/processed/{self._prefix}/item_visit_time_features.csv"
 
     def to_seq_data(
         self,
@@ -207,13 +212,78 @@ class DataProcessor:
                 raise ValueError(f"Missing required column '{col}' in geo csv")
 
         geo_df["item_id"] = geo_df["item_id"].astype(int) + item_id_offset
-        lat = geo_df["Latitude"].astype(float)
-        lon = geo_df["Longitude"].astype(float)
 
-        # Keep Fourier inputs separated from discrete geo ids.
-        geo_df["lat_norm"] = (lat / 90.0).clip(-1.0, 1.0)
-        geo_df["lon_norm"] = (lon / 180.0).clip(-1.0, 1.0)
-        return geo_df[["item_id", "lat_norm", "lon_norm"]]
+        geo_embed_dim = 128
+        geo_feature = np.vstack(
+            [
+                self._geo_fourier_embedding(float(lat), float(lng), dim=geo_embed_dim)
+                for lat, lng in zip(geo_df["Latitude"], geo_df["Longitude"])
+            ]
+        ).astype(np.float32)
+        geo_cols = [f"geo_fourier_{i}" for i in range(geo_embed_dim)]
+        geo_feature_df = pd.DataFrame(geo_feature, columns=geo_cols)
+        return pd.concat(
+            [geo_df[["item_id"]].reset_index(drop=True), geo_feature_df],
+            axis=1,
+        )
+
+    def _geo_fourier_embedding(self, lat: float, lng: float, dim: int) -> np.ndarray:
+        if dim % 4 != 0:
+            raise ValueError("geo_fourier_embedding dim must be divisible by 4.")
+        lat_rad = math.radians(lat)
+        lng_rad = math.radians(lng)
+        vec = []
+        for k in range(dim // 4):
+            freq = 2 * math.pi * k
+            vec.extend(
+                [
+                    math.sin(freq * lat_rad),
+                    math.cos(freq * lat_rad),
+                    math.sin(freq * lng_rad),
+                    math.cos(freq * lng_rad),
+                ]
+            )
+        return np.asarray(vec, dtype=np.float32)
+
+    def _visit_time_to_24_multihot(self, x: object) -> np.ndarray:
+        parsed = {}
+        if isinstance(x, dict):
+            parsed = x
+        elif isinstance(x, str):
+            s = x.strip()
+            if s != "":
+                try:
+                    parsed = json.loads(s)
+                except json.JSONDecodeError:
+                    # Some csv exports may wrap json with doubled quotes.
+                    parsed = json.loads(s.replace('""', '"'))
+
+        vec = np.zeros(24, dtype=np.float32)
+        for h in parsed.keys():
+            hour = int(h)
+            if 0 <= hour < 24:
+                vec[hour] = 1.0
+        return vec
+
+    def _build_item_visit_time_features_df(
+        self,
+        geo_df: pd.DataFrame,
+        item_id_offset: int,
+    ) -> pd.DataFrame:
+        if "item_id" not in geo_df.columns:
+            raise ValueError("Missing required column 'item_id' in geo csv")
+        if "visit_time_and_count" not in geo_df.columns:
+            raise ValueError("Missing required column 'visit_time_and_count' in geo csv")
+
+        work_df = geo_df[["item_id", "visit_time_and_count"]].copy()
+        work_df["item_id"] = work_df["item_id"].astype(int) + item_id_offset
+
+        visit_time = np.vstack(
+            work_df["visit_time_and_count"].apply(self._visit_time_to_24_multihot).tolist()
+        ).astype(np.float32)
+        visit_cols = [f"visit_hour_{i}" for i in range(24)]
+        visit_df = pd.DataFrame(visit_time, columns=visit_cols)
+        return pd.concat([work_df[["item_id"]].reset_index(drop=True), visit_df], axis=1)
 
     def file_exists(self, name: str) -> bool:
         return os.path.isfile("%s/%s" % (os.getcwd(), name))
@@ -304,6 +374,16 @@ class CustomSequenceDataProcessor(DataProcessor):
                 self.output_item_geo_fourier_features_csv(),
                 index=False,
             )
+
+            if "visit_time_and_count" in geo_df.columns:
+                item_visit_time_df = self._build_item_visit_time_features_df(
+                    geo_df=geo_df,
+                    item_id_offset=self._item_id_offset,
+                )
+                item_visit_time_df.to_csv(
+                    self.output_item_visit_time_features_csv(),
+                    index=False,
+                )
 
         all_item_ids = [
             item_id for seq in seq_df["sequence_item_ids"].tolist() for item_id in seq

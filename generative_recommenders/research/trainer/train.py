@@ -193,11 +193,8 @@ def train_fn(
         embedding_module = FourierGeoEmbeddingModule(
             num_items=dataset.max_item_id,
             item_embedding_dim=item_embedding_dim,
-            item_geo_lat_norm=dataset.item_geo_lat_norm,
-            item_geo_lon_norm=dataset.item_geo_lon_norm,
-            fourier_num_bands=fourier_num_bands,
-            fourier_scale=fourier_scale,
-            fourier_seed=fourier_seed,
+            item_geo_fourier_features=dataset.item_geo_fourier_features,
+            item_visit_time_features=dataset.item_visit_time_features,
         )
     else:
         raise ValueError(f"Unknown embedding_module_type {embedding_module_type}")

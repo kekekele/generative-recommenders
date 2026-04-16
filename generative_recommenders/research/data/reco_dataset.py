@@ -42,8 +42,8 @@ class RecoDataset:
     item_geo_region_ids: torch.Tensor
     item_geo_cell_l5_ids: torch.Tensor
     item_geo_cell_l7_ids: torch.Tensor
-    item_geo_lat_norm: torch.Tensor
-    item_geo_lon_norm: torch.Tensor
+    item_geo_fourier_features: torch.Tensor
+    item_visit_time_features: torch.Tensor
 
 
 def _get_item_geo_features_csv_candidates(dataset_name: str) -> List[str]:
@@ -58,6 +58,13 @@ def _get_item_geo_fourier_features_csv_candidates(dataset_name: str) -> List[str
     return [
         f"tmp/processed/{dataset_name}/item_geo_fourier_features.csv",
         f"tmp/processed/{dataset_name.replace('-', '_')}/item_geo_fourier_features.csv",
+    ]
+
+
+def _get_item_visit_time_features_csv_candidates(dataset_name: str) -> List[str]:
+    return [
+        f"tmp/processed/{dataset_name}/item_visit_time_features.csv",
+        f"tmp/processed/{dataset_name.replace('-', '_')}/item_visit_time_features.csv",
     ]
 
 
@@ -104,9 +111,12 @@ def _load_item_geo_tensors(
 def _load_item_geo_fourier_tensors(
     dataset_name: str,
     max_item_id: int,
-) -> List[torch.Tensor]:
-    item_geo_lat_norm = torch.zeros((max_item_id + 1,), dtype=torch.float32)
-    item_geo_lon_norm = torch.zeros((max_item_id + 1,), dtype=torch.float32)
+) -> torch.Tensor:
+    geo_fourier_dim = 128
+    item_geo_fourier_features = torch.zeros(
+        (max_item_id + 1, geo_fourier_dim),
+        dtype=torch.float32,
+    )
 
     geo_csv = None
     for candidate in _get_item_geo_fourier_features_csv_candidates(dataset_name):
@@ -119,11 +129,15 @@ def _load_item_geo_fourier_tensors(
             f"[reco_dataset] item_geo_fourier_features.csv not found for {dataset_name}; "
             "falling back to all-zero Fourier geo features"
         )
-        return [item_geo_lat_norm, item_geo_lon_norm]
+        return item_geo_fourier_features
 
     geo_df = pd.read_csv(geo_csv)
-    required_cols = ["item_id", "lat_norm", "lon_norm"]
-    for col in required_cols:
+    if "item_id" not in geo_df.columns:
+        raise ValueError(
+            f"{geo_csv} missing required column item_id; found {list(geo_df.columns)}"
+        )
+    fourier_cols = [f"geo_fourier_{i}" for i in range(geo_fourier_dim)]
+    for col in fourier_cols:
         if col not in geo_df.columns:
             raise ValueError(
                 f"{geo_csv} missing required column {col}; found {list(geo_df.columns)}"
@@ -133,10 +147,52 @@ def _load_item_geo_fourier_tensors(
         item_id = int(getattr(row, "item_id"))
         if item_id < 0 or item_id > max_item_id:
             continue
-        item_geo_lat_norm[item_id] = float(getattr(row, "lat_norm"))
-        item_geo_lon_norm[item_id] = float(getattr(row, "lon_norm"))
+        item_geo_fourier_features[item_id] = torch.tensor(
+            [float(getattr(row, col)) for col in fourier_cols],
+            dtype=torch.float32,
+        )
 
-    return [item_geo_lat_norm, item_geo_lon_norm]
+    return item_geo_fourier_features
+
+
+def _load_item_visit_time_tensor(
+    dataset_name: str,
+    max_item_id: int,
+) -> torch.Tensor:
+    visit_time = torch.zeros((max_item_id + 1, 24), dtype=torch.float32)
+
+    feature_csv = None
+    for candidate in _get_item_visit_time_features_csv_candidates(dataset_name):
+        if os.path.exists(candidate):
+            feature_csv = candidate
+            break
+
+    if feature_csv is None:
+        print(
+            f"[reco_dataset] item_visit_time_features.csv not found for {dataset_name}; "
+            "falling back to all-zero visit-time features"
+        )
+        return visit_time
+
+    feature_df = pd.read_csv(feature_csv)
+    required_cols = ["item_id"] + [f"visit_hour_{i}" for i in range(24)]
+    for col in required_cols:
+        if col not in feature_df.columns:
+            raise ValueError(
+                f"{feature_csv} missing required column {col}; found {list(feature_df.columns)}"
+            )
+
+    visit_cols = [f"visit_hour_{i}" for i in range(24)]
+    for row in feature_df.itertuples(index=False):
+        item_id = int(getattr(row, "item_id"))
+        if item_id < 0 or item_id > max_item_id:
+            continue
+        visit_time[item_id] = torch.tensor(
+            [float(getattr(row, col)) for col in visit_cols],
+            dtype=torch.float32,
+        )
+
+    return visit_time
 
 
 def _infer_item_stats_from_sequence_csv(ratings_file: str) -> List[int]:
@@ -334,7 +390,12 @@ def get_reco_dataset(
         max_item_id=max_item_id,  # pyre-ignore [6]
     )
 
-    [item_geo_lat_norm, item_geo_lon_norm] = _load_item_geo_fourier_tensors(
+    item_geo_fourier_features = _load_item_geo_fourier_tensors(
+        dataset_name=dataset_name,
+        max_item_id=max_item_id,  # pyre-ignore [6]
+    )
+
+    item_visit_time_features = _load_item_visit_time_tensor(
         dataset_name=dataset_name,
         max_item_id=max_item_id,  # pyre-ignore [6]
     )
@@ -345,8 +406,10 @@ def get_reco_dataset(
     assert item_geo_region_ids.size(0) == max_item_id + 1  # pyre-ignore [6]
     assert item_geo_cell_l5_ids.size(0) == max_item_id + 1  # pyre-ignore [6]
     assert item_geo_cell_l7_ids.size(0) == max_item_id + 1  # pyre-ignore [6]
-    assert item_geo_lat_norm.size(0) == max_item_id + 1  # pyre-ignore [6]
-    assert item_geo_lon_norm.size(0) == max_item_id + 1  # pyre-ignore [6]
+    assert item_geo_fourier_features.size(0) == max_item_id + 1  # pyre-ignore [6]
+    assert item_geo_fourier_features.size(1) == 128
+    assert item_visit_time_features.size(0) == max_item_id + 1  # pyre-ignore [6]
+    assert item_visit_time_features.size(1) == 24
 
     return RecoDataset(
         max_sequence_length=max_sequence_length,
@@ -360,6 +423,6 @@ def get_reco_dataset(
         item_geo_region_ids=item_geo_region_ids,
         item_geo_cell_l5_ids=item_geo_cell_l5_ids,
         item_geo_cell_l7_ids=item_geo_cell_l7_ids,
-        item_geo_lat_norm=item_geo_lat_norm,
-        item_geo_lon_norm=item_geo_lon_norm,
+        item_geo_fourier_features=item_geo_fourier_features,
+        item_visit_time_features=item_visit_time_features,
     )
