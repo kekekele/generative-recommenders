@@ -20,6 +20,12 @@ import torch
 from generative_recommenders.research.modeling.initialization import truncated_normal
 
 
+# Modification log:
+# - 2026-04-16: Added GeoAwareEmbeddingModule for recall-stage item embedding
+#   adaptation with geo side-information (region/cell-l5/cell-l7) and additive
+#   fusion on top of item-id embedding.
+
+
 class EmbeddingModule(torch.nn.Module):
     @abc.abstractmethod
     def debug_str(self) -> str:
@@ -64,6 +70,108 @@ class LocalEmbeddingModule(EmbeddingModule):
 
     def get_item_embeddings(self, item_ids: torch.Tensor) -> torch.Tensor:
         return self._item_emb(item_ids)
+
+    @property
+    def item_embedding_dim(self) -> int:
+        return self._item_embedding_dim
+
+
+class GeoAwareEmbeddingModule(EmbeddingModule):
+    def __init__(
+        self,
+        num_items: int,
+        item_embedding_dim: int,
+        item_geo_region_ids: torch.Tensor,
+        item_geo_cell_l5_ids: torch.Tensor,
+        item_geo_cell_l7_ids: torch.Tensor,
+        num_geo_regions: int,
+        num_geo_cells_l5: int,
+        num_geo_cells_l7: int,
+        geo_embedding_dim: int,
+    ) -> None:
+        super().__init__()
+
+        self._item_embedding_dim: int = item_embedding_dim
+        self._item_emb: torch.nn.Embedding = torch.nn.Embedding(
+            num_items + 1,
+            item_embedding_dim,
+            padding_idx=0,
+        )
+
+        self._geo_region_emb: torch.nn.Embedding = torch.nn.Embedding(
+            num_geo_regions + 1,
+            geo_embedding_dim,
+            padding_idx=0,
+        )
+        self._geo_cell_l5_emb: torch.nn.Embedding = torch.nn.Embedding(
+            num_geo_cells_l5 + 1,
+            geo_embedding_dim,
+            padding_idx=0,
+        )
+        self._geo_cell_l7_emb: torch.nn.Embedding = torch.nn.Embedding(
+            num_geo_cells_l7 + 1,
+            geo_embedding_dim,
+            padding_idx=0,
+        )
+
+        # Keep geo lookup tensors with the module for DDP/device moves.
+        self.register_buffer("_item_geo_region_ids", item_geo_region_ids.long())
+        self.register_buffer("_item_geo_cell_l5_ids", item_geo_cell_l5_ids.long())
+        self.register_buffer("_item_geo_cell_l7_ids", item_geo_cell_l7_ids.long())
+
+        # Additive residual fusion: item_id_emb + proj([region, l5, l7]).
+        # No bias in projection so zero-input stays zero for padding paths.
+        self._geo_proj: torch.nn.Module = torch.nn.Sequential(
+            torch.nn.Linear(
+                in_features=geo_embedding_dim * 3,
+                out_features=item_embedding_dim,
+                bias=False,
+            ),
+            torch.nn.LayerNorm(item_embedding_dim),
+        )
+
+        self.reset_params()
+
+    def debug_str(self) -> str:
+        return f"geo_aware_emb_d{self._item_embedding_dim}"
+
+    def reset_params(self) -> None:
+        truncated_normal(self._item_emb.weight, mean=0.0, std=0.02)
+        truncated_normal(self._geo_region_emb.weight, mean=0.0, std=0.02)
+        truncated_normal(self._geo_cell_l5_emb.weight, mean=0.0, std=0.02)
+        truncated_normal(self._geo_cell_l7_emb.weight, mean=0.0, std=0.02)
+
+        for module in self._geo_proj.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+
+    def _safe_geo_lookup(self, item_ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+        # Guard against out-of-range ids during warm-up/data mismatch.
+        max_id = table.size(0) - 1
+        safe_ids = item_ids.clamp(min=0, max=max_id)
+        return table[safe_ids]
+
+    def get_item_embeddings(self, item_ids: torch.Tensor) -> torch.Tensor:
+        item_emb = self._item_emb(item_ids)
+
+        region_ids = self._safe_geo_lookup(item_ids, self._item_geo_region_ids)
+        cell_l5_ids = self._safe_geo_lookup(item_ids, self._item_geo_cell_l5_ids)
+        cell_l7_ids = self._safe_geo_lookup(item_ids, self._item_geo_cell_l7_ids)
+
+        region_ids = region_ids.clamp(min=0, max=self._geo_region_emb.num_embeddings - 1)
+        cell_l5_ids = cell_l5_ids.clamp(min=0, max=self._geo_cell_l5_emb.num_embeddings - 1)
+        cell_l7_ids = cell_l7_ids.clamp(min=0, max=self._geo_cell_l7_emb.num_embeddings - 1)
+
+        region_emb = self._geo_region_emb(region_ids)
+        cell_l5_emb = self._geo_cell_l5_emb(cell_l5_ids)
+        cell_l7_emb = self._geo_cell_l7_emb(cell_l7_ids)
+
+        geo_emb = torch.cat([region_emb, cell_l5_emb, cell_l7_emb], dim=-1)
+        geo_delta = self._geo_proj(geo_emb)
+
+        # Keep padding id=0 strictly on the item embedding path.
+        geo_delta = geo_delta * (item_ids != 0).unsqueeze(-1).to(geo_delta.dtype)
+        return item_emb + geo_delta
 
     @property
     def item_embedding_dim(self) -> int:

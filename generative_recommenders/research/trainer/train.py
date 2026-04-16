@@ -39,6 +39,7 @@ from generative_recommenders.research.modeling.sequential.autoregressive_losses 
 )
 from generative_recommenders.research.modeling.sequential.embedding_modules import (
     EmbeddingModule,
+    GeoAwareEmbeddingModule,
     LocalEmbeddingModule,
 )
 from generative_recommenders.research.modeling.sequential.encoder_utils import (
@@ -123,6 +124,10 @@ def train_fn(
     partial_eval_num_iters: int = 32,
     embedding_module_type: str = "local",
     item_embedding_dim: int = 240,
+    geo_embedding_dim: int = 16,
+    num_geo_regions: int = 4096,
+    num_geo_cells_l5: int = 65536,
+    num_geo_cells_l7: int = 262144,
     interaction_module_type: str = "",
     gr_output_length: int = 10,
     l2_norm_eps: float = 1e-6,
@@ -167,6 +172,18 @@ def train_fn(
         embedding_module: EmbeddingModule = LocalEmbeddingModule(
             num_items=dataset.max_item_id,
             item_embedding_dim=item_embedding_dim,
+        )
+    elif embedding_module_type == "geo_aware":
+        embedding_module = GeoAwareEmbeddingModule(
+            num_items=dataset.max_item_id,
+            item_embedding_dim=item_embedding_dim,
+            item_geo_region_ids=dataset.item_geo_region_ids,
+            item_geo_cell_l5_ids=dataset.item_geo_cell_l5_ids,
+            item_geo_cell_l7_ids=dataset.item_geo_cell_l7_ids,
+            num_geo_regions=num_geo_regions,
+            num_geo_cells_l5=num_geo_cells_l5,
+            num_geo_cells_l7=num_geo_cells_l7,
+            geo_embedding_dim=geo_embedding_dim,
         )
     else:
         raise ValueError(f"Unknown embedding_module_type {embedding_module_type}")
@@ -245,7 +262,7 @@ def train_fn(
     elif sampling_strategy == "local":
         negatives_sampler = LocalNegativesSampler(
             num_items=dataset.max_item_id,
-            item_emb=model._embedding_module._item_emb,
+            embedding_module=embedding_module,
             all_item_ids=dataset.all_item_ids,
             l2_norm=item_l2_norm,
             l2_norm_eps=l2_norm_eps,

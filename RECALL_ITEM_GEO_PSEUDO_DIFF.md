@@ -11,6 +11,45 @@
 
 ## 文件 1: generative_recommenders/research/data/preprocessor.py
 
+## 0) 先决策略：保证原始数据集不受影响
+
+### 调整结论
+
+需要调整。`preprocessor.py` 的 geo 相关逻辑应改为“可选且默认关闭”，避免影响仓库现有公开实验数据流。
+
+### 兼容原则
+
+1. 不改现有 `MovielensDataProcessor.preprocess_rating()` 的默认行为。
+2. 不改现有 `AmazonDataProcessor.preprocess_rating()` 的默认行为。
+3. geo 与自定义 schema 归一化只在“自定义入口”启用。
+4. 默认参数必须保证原始配置不变（即不传 geo 文件也不启用额外归一化）。
+
+### 推荐实现方式（伪补丁）
+
+- 方案 A（推荐）：新增 `CustomSequenceDataProcessor`，仅处理你的外部序列文件与 geo 文件。
+- 方案 B（次选）：在原有 `preprocess_rating()` 中加开关，默认 `False`。
+
+若采用方案 B，建议新增参数：
+
+```python
+enable_custom_schema_normalization: bool = False
+geo_csv_path: Optional[str] = None
+```
+
+并严格按开关执行：
+
+```python
+if enable_custom_schema_normalization:
+    # 才执行 UserId/UTCTimeOffset/ratings 补齐/id 偏移
+    ...
+
+if geo_csv_path is not None and os.path.exists(geo_csv_path):
+    # 才生成 item_geo_features.csv
+    ...
+```
+
+---
+
 ## 1) 插入点总览（精确落位）
 
 ### Before
@@ -26,6 +65,11 @@
 3. 在 `MovielensDataProcessor.preprocess_rating()` 的 `seq_ratings_data = self.to_seq_data(...)` 之前插入序列归一化。
 4. 在 `MovielensDataProcessor.preprocess_rating()` 的序列构建阶段插入 geo 文件生成。
 5. 在 `AmazonDataProcessor.preprocess_rating()` 按相同模式插入序列归一化与 geo 文件生成。
+
+并补一个总开关要求：
+
+- 只有在 `enable_custom_schema_normalization=True` 时才触发插入点 C/E。
+- 只有在 `geo_csv_path` 有效时才触发插入点 D/E 的 geo 输出。
 
 ---
 
@@ -63,19 +107,24 @@ def _normalize_custom_sequence_schema(self, seq_df: pd.DataFrame) -> pd.DataFram
     if "sequence_UTCTimeOffset" in seq_df.columns:
         seq_df = seq_df.rename(columns={"sequence_UTCTimeOffset": "sequence_timestamps"})
 
-    seq_df["sequence_item_ids"] = seq_df["sequence_item_ids"].apply(eval)
-    seq_df["sequence_timestamps"] = seq_df["sequence_timestamps"].apply(eval)
+    # Current expected format:
+    # - sequence_item_ids: "333, 286, 5093"
+    # - sequence_timestamps: "1333845188,1333847015,1333847448"
+    seq_df["sequence_item_ids"] = seq_df["sequence_item_ids"].apply(
+        lambda s: [int(v.strip()) for v in str(s).split(",") if v.strip() != ""]
+    )
+    seq_df["sequence_timestamps"] = seq_df["sequence_timestamps"].apply(
+        lambda s: [int(v.strip()) for v in str(s).split(",") if v.strip() != ""]
+    )
 
     if "sequence_ratings" not in seq_df.columns:
         seq_df["sequence_ratings"] = seq_df["sequence_item_ids"].apply(
             lambda seq: [1 for _ in seq]
         )
     else:
-        seq_df["sequence_ratings"] = seq_df["sequence_ratings"].apply(eval)
-
-    seq_df["sequence_timestamps"] = seq_df["sequence_timestamps"].apply(
-        lambda seq: [int(pd.Timestamp(x).timestamp()) for x in seq]
-    )
+        seq_df["sequence_ratings"] = seq_df["sequence_ratings"].apply(
+            lambda s: [int(float(v.strip())) for v in str(s).split(",") if v.strip() != ""]
+        )
 
     for row in seq_df.itertuples():
         assert len(row.sequence_item_ids) == len(row.sequence_ratings)
@@ -117,6 +166,14 @@ def _build_item_geo_features_df(self, geo_df: pd.DataFrame) -> pd.DataFrame:
         geo_df.loc[geo_df[col] < 1, col] = 0
 
     return geo_df[["item_id", "geo_region_id", "geo_cell_l5", "geo_cell_l7"]]
+
+
+def _parse_sequence_column(self, x):
+    # Current format only: comma-separated string, e.g. "333, 286, 5093"
+    s = str(x).strip()
+    if s == "":
+        return []
+    return [int(v.strip()) for v in s.split(",") if v.strip() != ""]
 ```
 
 ---
@@ -132,9 +189,10 @@ def _build_item_geo_features_df(self, geo_df: pd.DataFrame) -> pd.DataFrame:
 ```python
 seq_ratings_data = self.to_seq_data(seq_ratings_data, users)
 
-# optional custom schema normalization for external sequence sources
-seq_ratings_data = self._normalize_custom_sequence_schema(seq_ratings_data)
-seq_ratings_data = self._shift_item_ids_for_model(seq_ratings_data)
+if enable_custom_schema_normalization:
+    # optional custom schema normalization for external sequence sources
+    seq_ratings_data = self._normalize_custom_sequence_schema(seq_ratings_data)
+    seq_ratings_data = self._shift_item_ids_for_model(seq_ratings_data)
 
 seq_ratings_data.sample(frac=1).reset_index().to_csv(
     self.output_format_csv(), index=False, sep="," 
@@ -143,8 +201,8 @@ seq_ratings_data.sample(frac=1).reset_index().to_csv(
 
 说明：
 
-- 如果你继续用 MovieLens 原始公开数据，这两步可以由开关控制。
-- 如果你替换成你的样例输入，这两步应开启。
+- 如果继续跑仓库原始公开数据，保持 `enable_custom_schema_normalization=False`。
+- 如果用你的外部样例输入，再启用该开关。
 
 ---
 
@@ -179,8 +237,10 @@ if geo_csv_path is not None and os.path.exists(geo_csv_path):
 
 ```python
 seq_ratings_data = self.to_seq_data(seq_ratings_data)
-seq_ratings_data = self._normalize_custom_sequence_schema(seq_ratings_data)
-seq_ratings_data = self._shift_item_ids_for_model(seq_ratings_data)
+
+if enable_custom_schema_normalization:
+    seq_ratings_data = self._normalize_custom_sequence_schema(seq_ratings_data)
+    seq_ratings_data = self._shift_item_ids_for_model(seq_ratings_data)
 
 seq_ratings_data.sample(frac=1).reset_index().to_csv(
     self.output_format_csv(), index=False, sep="," 
@@ -209,6 +269,28 @@ if geo_csv_path is not None and os.path.exists(geo_csv_path):
    - `geo_cell_l7`
 4. `item_geo_features.csv` 中 `item_id` 最小值 `>= 1`。
 5. 序列长度一致性断言不触发。
+
+补充验收（避免影响原始数据集）：
+
+6. 在默认参数下，原始 `ml-1m/ml-20m/amzn-books` 的输出文件与改动前保持同字段、同语义。
+7. 在不提供 `geo_csv_path` 时，不生成或不覆盖原有实验关键文件。
+
+---
+
+## 8) 针对你当前已处理训练数据的特别说明
+
+你当前序列样例是：
+
+- `user_id,sequence_item_ids,sequence_timestamps`
+- `sequence_item_ids` / `sequence_timestamps` 是逗号字符串（非方括号）
+- 没有 `sequence_ratings`
+
+这意味着：
+
+1. 必须走 `enable_custom_schema_normalization=True`。
+2. 只按逗号字符串格式解析，不再兼容方括号列表格式。
+3. 必须补 `sequence_ratings`（默认全 1）才能兼容现有训练逻辑。
+4. geo 文件中 `item_id` 也应执行与序列一致的 id 偏移策略（若训练保留 0 为 padding，则 geo 需同步 +1）。
 
 ---
 

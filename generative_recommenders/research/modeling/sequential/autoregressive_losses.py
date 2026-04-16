@@ -20,8 +20,17 @@ from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
+from generative_recommenders.research.modeling.sequential.embedding_modules import (
+    EmbeddingModule,
+)
 from generative_recommenders.research.rails.similarities.module import SimilarityModule
 from torch.utils.checkpoint import checkpoint
+
+
+# Modification log:
+# - 2026-04-16: LocalNegativesSampler now consumes EmbeddingModule instead of
+#   raw torch.nn.Embedding so geo-aware item embedding paths are respected in
+#   local negative sampling.
 
 
 class NegativesSampler(torch.nn.Module):
@@ -72,7 +81,7 @@ class LocalNegativesSampler(NegativesSampler):
     def __init__(
         self,
         num_items: int,
-        item_emb: torch.nn.Embedding,
+        embedding_module: EmbeddingModule,
         all_item_ids: List[int],
         l2_norm: bool,
         l2_norm_eps: float,
@@ -80,7 +89,7 @@ class LocalNegativesSampler(NegativesSampler):
         super().__init__(l2_norm=l2_norm, l2_norm_eps=l2_norm_eps)
 
         self._num_items: int = len(all_item_ids)
-        self._item_emb: torch.nn.Embedding = item_emb
+        self._embedding_module: EmbeddingModule = embedding_module
         self.register_buffer("_all_item_ids", torch.tensor(all_item_ids))
 
     def debug_str(self) -> str:
@@ -106,7 +115,6 @@ class LocalNegativesSampler(NegativesSampler):
         Returns:
             A tuple of (sampled_ids, sampled_negative_embeddings).
         """
-        # assert torch.max(torch.abs(self._item_emb(positive_ids) - positive_embeddings)) < 1e-4
         output_shape = positive_ids.size() + (num_to_sample,)
         sampled_offsets = torch.randint(
             low=0,
@@ -116,7 +124,8 @@ class LocalNegativesSampler(NegativesSampler):
             device=positive_ids.device,
         )
         sampled_ids = self._all_item_ids[sampled_offsets.view(-1)].reshape(output_shape)
-        return sampled_ids, self.normalize_embeddings(self._item_emb(sampled_ids))
+        sampled_embeddings = self._embedding_module.get_item_embeddings(sampled_ids)
+        return sampled_ids, self.normalize_embeddings(sampled_embeddings)
 
 
 class InBatchNegativesSampler(NegativesSampler):

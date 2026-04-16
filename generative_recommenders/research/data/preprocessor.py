@@ -19,7 +19,7 @@ import logging
 import os
 import sys
 import tarfile
-from typing import Dict, Optional, Union
+from typing import Dict, List, Optional, Union
 from urllib.request import urlretrieve
 from zipfile import ZipFile
 
@@ -61,6 +61,9 @@ class DataProcessor:
     def output_format_csv(self) -> str:
         return f"tmp/{self._prefix}/sasrec_format.csv"
 
+    def output_item_geo_features_csv(self) -> str:
+        return f"tmp/processed/{self._prefix}/item_geo_features.csv"
+
     def to_seq_data(
         self,
         ratings_data: pd.DataFrame,
@@ -91,6 +94,104 @@ class DataProcessor:
         )
         return ratings_data_transformed
 
+    def _parse_sequence_column(self, x: object) -> List[int]:
+        # Current expected format is comma-separated values, e.g. "333, 286, 5093".
+        s = str(x).strip()
+        if s == "":
+            return []
+        return [int(v.strip()) for v in s.split(",") if v.strip() != ""]
+
+    def _normalize_custom_sequence_schema(self, seq_df: pd.DataFrame) -> pd.DataFrame:
+        seq_df = seq_df.copy()
+        if "UserId" in seq_df.columns:
+            seq_df.rename(columns={"UserId": "user_id"}, inplace=True)
+        if "sequence_UTCTimeOffset" in seq_df.columns:
+            seq_df.rename(
+                columns={"sequence_UTCTimeOffset": "sequence_timestamps"},
+                inplace=True,
+            )
+
+        required_cols = ["user_id", "sequence_item_ids", "sequence_timestamps"]
+        for col in required_cols:
+            if col not in seq_df.columns:
+                raise ValueError(f"Missing required column '{col}' in custom sequence csv")
+
+        seq_df["sequence_item_ids"] = seq_df["sequence_item_ids"].apply(
+            self._parse_sequence_column
+        )
+        seq_df["sequence_timestamps"] = seq_df["sequence_timestamps"].apply(
+            self._parse_sequence_column
+        )
+
+        if "sequence_ratings" not in seq_df.columns:
+            seq_df["sequence_ratings"] = seq_df["sequence_item_ids"].apply(
+                lambda seq: [1 for _ in seq]
+            )
+        else:
+            seq_df["sequence_ratings"] = seq_df["sequence_ratings"].apply(
+                self._parse_sequence_column
+            )
+
+        for row in seq_df.itertuples(index=False):
+            if len(row.sequence_item_ids) != len(row.sequence_ratings):
+                raise ValueError(
+                    "sequence_item_ids and sequence_ratings length mismatch"
+                )
+            if len(row.sequence_item_ids) != len(row.sequence_timestamps):
+                raise ValueError(
+                    "sequence_item_ids and sequence_timestamps length mismatch"
+                )
+
+        return seq_df[
+            [
+                "user_id",
+                "sequence_item_ids",
+                "sequence_ratings",
+                "sequence_timestamps",
+            ]
+        ]
+
+    def _shift_item_ids_for_model(
+        self,
+        seq_df: pd.DataFrame,
+        item_id_offset: int,
+    ) -> pd.DataFrame:
+        seq_df = seq_df.copy()
+        seq_df["sequence_item_ids"] = seq_df["sequence_item_ids"].apply(
+            lambda seq: [int(x) + item_id_offset for x in seq]
+        )
+        return seq_df
+
+    def _build_item_geo_features_df(
+        self,
+        geo_df: pd.DataFrame,
+        item_id_offset: int,
+    ) -> pd.DataFrame:
+        geo_df = geo_df.copy()
+
+        for col in ["item_id", "Latitude", "Longitude"]:
+            if col not in geo_df.columns:
+                raise ValueError(f"Missing required column '{col}' in geo csv")
+
+        geo_df["item_id"] = geo_df["item_id"].astype(int) + item_id_offset
+
+        lat = geo_df["Latitude"].astype(float)
+        lon = geo_df["Longitude"].astype(float)
+        lat_bin = np.floor((lat + 90.0) * 100.0).astype(int)
+        lon_bin = np.floor((lon + 180.0) * 100.0).astype(int)
+
+        # Use fixed-width lat/lon bins to build deterministic coarse and fine geo ids.
+        geo_df["_geo_l5_key"] = (lat_bin // 10).astype(str) + "_" + (lon_bin // 10).astype(
+            str
+        )
+        geo_df["_geo_l7_key"] = lat_bin.astype(str) + "_" + lon_bin.astype(str)
+
+        geo_df["geo_region_id"] = pd.Categorical(geo_df["_geo_l5_key"]).codes + 1
+        geo_df["geo_cell_l5"] = pd.Categorical(geo_df["_geo_l5_key"]).codes + 1
+        geo_df["geo_cell_l7"] = pd.Categorical(geo_df["_geo_l7_key"]).codes + 1
+
+        return geo_df[["item_id", "geo_region_id", "geo_cell_l5", "geo_cell_l7"]]
+
     def file_exists(self, name: str) -> bool:
         return os.path.isfile("%s/%s" % (os.getcwd(), name))
 
@@ -106,6 +207,94 @@ class MovielensSyntheticDataProcessor(DataProcessor):
 
     def preprocess_rating(self) -> None:
         return
+
+
+class CustomSequenceDataProcessor(DataProcessor):
+    """
+    Scheme A processor for external sequence data and optional item geo side-info.
+
+    It does not modify existing MovieLens/Amazon preprocessors and is intended to be
+    used explicitly when custom sequence and geo csv files are provided.
+    """
+
+    def __init__(
+        self,
+        prefix: str,
+        sequence_csv_path: str,
+        geo_csv_path: Optional[str] = None,
+        item_id_offset: int = 1,
+        expected_num_unique_items: Optional[int] = None,
+        expected_max_item_id: Optional[int] = None,
+    ) -> None:
+        super().__init__(prefix, expected_num_unique_items, expected_max_item_id)
+        self._sequence_csv_path = sequence_csv_path
+        self._geo_csv_path = geo_csv_path
+        self._item_id_offset = item_id_offset
+
+    def processed_item_csv(self) -> str:
+        return self.output_item_geo_features_csv()
+
+    def preprocess_rating(self) -> int:
+        if not os.path.exists(self._sequence_csv_path):
+            raise FileNotFoundError(
+                f"Custom sequence csv not found: {self._sequence_csv_path}"
+            )
+
+        seq_df = pd.read_csv(self._sequence_csv_path)
+        seq_df = self._normalize_custom_sequence_schema(seq_df)
+        seq_df = self._shift_item_ids_for_model(seq_df, self._item_id_offset)
+
+        if not os.path.exists(f"tmp/{self._prefix}"):
+            os.makedirs(f"tmp/{self._prefix}")
+        if not os.path.exists(f"tmp/processed/{self._prefix}"):
+            os.makedirs(f"tmp/processed/{self._prefix}")
+
+        output_df = seq_df.copy()
+        output_df["sequence_item_ids"] = output_df["sequence_item_ids"].apply(
+            lambda x: ",".join([str(v) for v in x])
+        )
+        output_df["sequence_ratings"] = output_df["sequence_ratings"].apply(
+            lambda x: ",".join([str(v) for v in x])
+        )
+        output_df["sequence_timestamps"] = output_df["sequence_timestamps"].apply(
+            lambda x: ",".join([str(v) for v in x])
+        )
+        output_df.sample(frac=1).reset_index(drop=True).to_csv(
+            self.output_format_csv(), index=False, sep="," 
+        )
+
+        if self._geo_csv_path is not None:
+            if not os.path.exists(self._geo_csv_path):
+                raise FileNotFoundError(f"Geo csv not found: {self._geo_csv_path}")
+            geo_df = pd.read_csv(self._geo_csv_path)
+            item_geo_df = self._build_item_geo_features_df(
+                geo_df=geo_df,
+                item_id_offset=self._item_id_offset,
+            )
+            item_geo_df.to_csv(self.output_item_geo_features_csv(), index=False)
+
+        all_item_ids = [
+            item_id for seq in seq_df["sequence_item_ids"].tolist() for item_id in seq
+        ]
+        if len(all_item_ids) == 0:
+            raise ValueError("No item ids found in custom sequence csv")
+        num_unique_items = len(set(all_item_ids))
+        max_item_id = max(all_item_ids)
+
+        if self.expected_num_unique_items() is not None:
+            assert self.expected_num_unique_items() == num_unique_items, (
+                f"Expected items: {self.expected_num_unique_items()}, got: {num_unique_items}"
+            )
+        if self.expected_max_item_id() is not None:
+            assert self.expected_max_item_id() == max_item_id, (
+                f"Expected max item id: {self.expected_max_item_id()}, got: {max_item_id}"
+            )
+
+        logging.info(
+            f"{self._prefix}: custom preprocessing finished, "
+            f"num_unique_items={num_unique_items}, max_item_id={max_item_id}"
+        )
+        return num_unique_items
 
 
 class MovielensDataProcessor(DataProcessor):
