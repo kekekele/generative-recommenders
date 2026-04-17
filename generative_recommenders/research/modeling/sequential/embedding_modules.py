@@ -200,7 +200,7 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
             item_geo_fourier_features.float(),
         )
         self.register_buffer("_item_visit_time_features", item_visit_time_features.float())
-        self._geo_scale: float = 0.05
+        self._geo_gate_max_scale: float = 0.2
 
         if item_geo_fourier_features.dim() != 2:
             raise ValueError("item_geo_fourier_features must be rank-2 [num_items+1, dim]")
@@ -210,6 +210,12 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
             in_features=fourier_dim + 24,
             out_features=item_embedding_dim,
             bias=False,
+        )
+        # Minimal adaptive gate: initialized around 0.05 and bounded by max scale.
+        self._geo_gate: torch.nn.Module = torch.nn.Linear(
+            in_features=item_embedding_dim * 2,
+            out_features=1,
+            bias=True,
         )
 
         self.reset_params()
@@ -222,6 +228,10 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
         for module in self._geo_proj.modules():
             if isinstance(module, torch.nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
+        if isinstance(self._geo_gate, torch.nn.Linear):
+            torch.nn.init.zeros_(self._geo_gate.weight)
+            # 0.2 * sigmoid(bias) ~= 0.05  => sigmoid(bias)=0.25
+            self._geo_gate.bias.data.fill_(-1.0986123)
 
     def _safe_lookup(self, item_ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
         max_id = table.size(0) - 1
@@ -236,8 +246,13 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
         full_geo_feat = torch.cat([fourier_feat, visit_time_feat], dim=-1)
         geo_delta = self._geo_proj(full_geo_feat)
 
-        geo_delta = geo_delta * (item_ids != 0).unsqueeze(-1).to(geo_delta.dtype)
-        return item_emb + self._geo_scale * geo_delta
+        valid_mask = (item_ids != 0).unsqueeze(-1).to(geo_delta.dtype)
+        geo_delta = geo_delta * valid_mask
+
+        gate_input = torch.cat([item_emb, geo_delta], dim=-1)
+        gate = self._geo_gate_max_scale * torch.sigmoid(self._geo_gate(gate_input))
+        gate = gate.to(geo_delta.dtype) * valid_mask
+        return item_emb + gate * geo_delta
 
     @property
     def item_embedding_dim(self) -> int:
