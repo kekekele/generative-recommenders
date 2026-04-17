@@ -1,0 +1,43 @@
+加上geo特征的训练日志：
+Epoch 1/101: 100% 675/675 [16:23<00:00,  1.46s/batch, loss=2.5428, time=981.1s]
+2026-04-17 02:47:53 - root - INFO - rank 0: eval @ epoch 0: NDCG@10 0.0108, NDCG@50 0.0162, NDCG@200 0.0228, HR@10 0.0195, HR@50 0.0446, HR@200 0.0886, MRR 0.0103
+Epoch 2/101: 100% 675/675 [12:31<00:00,  1.11s/batch, loss=2.2081, time=749.4s]
+2026-04-17 03:02:19 - root - INFO - rank 0: eval @ epoch 1: NDCG@10 0.0149, NDCG@50 0.0224, NDCG@200 0.0307, HR@10 0.0268, HR@50 0.0617, HR@200 0.1166, MRR 0.0139
+Epoch 3/101: 100% 675/675 [12:29<00:00,  1.11s/batch, loss=1.8887, time=746.7s]
+2026-04-17 03:16:42 - root - INFO - rank 0: eval @ epoch 2: NDCG@10 0.0181, NDCG@50 0.0271, NDCG@200 0.0361, HR@10 0.0328, HR@50 0.0743, HR@200 0.1348, MRR 0.0166
+Epoch 4/101: 100% 675/675 [12:32<00:00,  1.11s/batch, loss=1.7193, time=749.2s]
+2026-04-17 03:31:05 - root - INFO - rank 0: eval @ epoch 3: NDCG@10 0.0210, NDCG@50 0.0308, NDCG@200 0.0406, HR@10 0.0382, HR@50 0.0836, HR@200 0.1485, MRR 0.0190
+Epoch 5/101: 100% 675/675 [12:31<00:00,  1.11s/batch, loss=1.7604, time=748.4s]
+2026-04-17 03:45:28 - root - INFO - rank 0: eval @ epoch 4: NDCG@10 0.0229, NDCG@50 0.0334, NDCG@200 0.0436, HR@10 0.0412, HR@50 0.0897, HR@200 0.1572, MRR 0.0208
+Epoch 6/101:  93%|625/675 [11:37<00:51,  1.02s/batch, loss=1.5670, time=697.6s]2026-04-17 03:57:07 - root - INFO - batch-stat (train): step 4000 (epoch 5 in 698.56s): 1.647392
+Epoch 6/101: 100% 675/675 [12:30<00:00,  1.11s/batch, loss=1.6456, time=747.8s]
+2026-04-17 03:59:51 - root - INFO - rank 0: eval @ epoch 5: NDCG@10 0.0243, NDCG@50 0.0354, NDCG@200 0.0457, HR@10 0.0437, HR@50 0.0947, HR@200 0.1635, MRR 0.0219
+Epoch 7/101: 100% 675/675 [12:29<00:00,  1.11s/batch, loss=1.6299, time=746.5s]
+2026-04-17 04:14:16 - root - INFO - rank 0: eval @ epoch 6: NDCG@10 0.0251, NDCG@50 0.0364, NDCG@200 0.0468, HR@10 0.0454, HR@50 0.0977, HR@200 0.1672, MRR 0.0225
+Epoch 8/101: 100% 675/675 [12:39<00:00,  1.13s/batch, loss=1.5717, time=755.4s]
+2026-04-17 04:29:26 - root - INFO - rank 0: eval @ epoch 7: NDCG@10 0.0264, NDCG@50 0.0381, NDCG@200 0.0486, HR@10 0.0477, HR@50 0.1015, HR@200 0.1712, MRR 0.0236
+Epoch 9/101: 100% 675/675 [13:17<00:00,  1.18s/batch, loss=1.6040, time=792.4s]
+2026-04-17 04:45:29 - root - INFO - rank 0: eval @ epoch 8: NDCG@10 0.0268, NDCG@50 0.0388, NDCG@200 0.0493, HR@10 0.0482, HR@50 0.1036, HR@200 0.1732, MRR 0.0240
+Epoch 10/101: 100% 675/675 [12:49<00:00,  1.14s/batch, loss=1.5529, time=766.7s]
+2026-04-17 05:00:16 - root - INFO - rank 0: eval @ epoch 9: NDCG@10 0.0278, NDCG@50 0.0402, NDCG@200 0.0507, HR@10 0.0501, HR@50 0.1073, HR@200 0.1771, MRR 0.0249
+
+
+不加geo特征
+2026-04-17 03:18:20 - root - INFO - batch-stat (train): step 0 (epoch 0 in 63.00s): 7.464955
+Epoch 1/101: 100%| 675/675 [12:24<00:00,  1.10s/batch, loss=0.8657, time=741.4s]
+2026-04-17 03:31:32 - root - INFO - rank 0: eval @ epoch 0: NDCG@10 0.0631, NDCG@50 0.0816, NDCG@200 0.0909, HR@10 0.1091, HR@50 0.1926, HR@200 0.2540, MRR 0.0540
+Epoch 2/101: 100%| 675/675 [12:19<00:00,  1.10s/batch, loss=0.7747, time=736.5s]
+2026-04-17 03:45:41 - root - INFO - rank 0: eval @ epoch 1: NDCG@10 0.0760, NDCG@50 0.0957, NDCG@200 0.1042, HR@10 0.1315, HR@50 0.2197, HR@200 0.2752, MRR 0.0643
+Epoch 3/101: 100%| 675/675 [12:21<00:00,  1.10s/batch, loss=0.6929, time=738.3s]
+2026-04-17 03:59:51 - root - INFO - rank 0: eval @ epoch 2: NDCG@10 0.0815, NDCG@50 0.1016, NDCG@200 0.1096, HR@10 0.1405, HR@50 0.2301, HR@200 0.2822, MRR 0.0688
+Epoch 4/101: 100%| 675/675 [12:20<00:00,  1.10s/batch, loss=0.6286, time=737.5s]
+2026-04-17 04:14:04 - root - INFO - rank 0: eval @ epoch 3: NDCG@10 0.0847, NDCG@50 0.1045, NDCG@200 0.1122, HR@10 0.1461, HR@50 0.2341, HR@200 0.2847, MRR 0.0712
+Epoch 5/101: 100%| 675/675 [12:28<00:00,  1.11s/batch, loss=0.6270, time=745.4s]
+2026-04-17 04:28:57 - root - INFO - rank 0: eval @ epoch 4: NDCG@10 0.0866, NDCG@50 0.1066, NDCG@200 0.1141, HR@10 0.1489, HR@50 0.2384, HR@200 0.2873, MRR 0.0728
+Epoch 6/101:  93%| 625/675 [12:07<00:50,  1.01s/batch, loss=0.6163, time=727.8s]2026-04-17 04:41:06 - root - INFO - batch-stat (train): step 4000 (epoch 5 in 728.77s): 0.610382
+Epoch 6/101: 100%| 675/675 [13:03<00:00,  1.16s/batch, loss=0.5642, time=779.5s]
+2026-04-17 04:44:43 - root - INFO - rank 0: eval @ epoch 5: NDCG@10 0.0871, NDCG@50 0.1071, NDCG@200 0.1146, HR@10 0.1508, HR@50 0.2398, HR@200 0.2887, MRR 0.0730
+Epoch 7/101: 100%| 675/675 [12:46<00:00,  1.13s/batch, loss=0.5934, time=762.8s]
+2026-04-17 04:59:24 - root - INFO - rank 0: eval @ epoch 6: NDCG@10 0.0880, NDCG@50 0.1083, NDCG@200 0.1156, HR@10 0.1523, HR@50 0.2426, HR@200 0.2898, MRR 0.0737
+Epoch 8/101: 100%| 675/675 [12:24<00:00,  1.10s/batch, loss=0.6352, time=742.0s]
+2026-04-17 05:13:38 - root - INFO - rank 0: eval @ epoch 7: NDCG@10 0.0886, NDCG@50 0.1089, NDCG@200 0.1162, HR@10 0.1529, HR@50 0.2432, HR@200 0.2909, MRR 0.0742

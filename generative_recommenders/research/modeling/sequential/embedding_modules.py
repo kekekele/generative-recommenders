@@ -200,18 +200,16 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
             item_geo_fourier_features.float(),
         )
         self.register_buffer("_item_visit_time_features", item_visit_time_features.float())
+        self._geo_scale: float = 0.05
 
         if item_geo_fourier_features.dim() != 2:
             raise ValueError("item_geo_fourier_features must be rank-2 [num_items+1, dim]")
         fourier_dim = item_geo_fourier_features.size(1)
 
-        self._geo_proj: torch.nn.Module = torch.nn.Sequential(
-            torch.nn.Linear(
-                in_features=fourier_dim + 24,
-                out_features=item_embedding_dim,
-                bias=False,
-            ),
-            torch.nn.LayerNorm(item_embedding_dim),
+        self._geo_proj: torch.nn.Module = torch.nn.Linear(
+            in_features=fourier_dim + 24,
+            out_features=item_embedding_dim,
+            bias=False,
         )
 
         self.reset_params()
@@ -239,7 +237,7 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
         geo_delta = self._geo_proj(full_geo_feat)
 
         geo_delta = geo_delta * (item_ids != 0).unsqueeze(-1).to(geo_delta.dtype)
-        return item_emb + geo_delta
+        return item_emb + self._geo_scale * geo_delta
 
     @property
     def item_embedding_dim(self) -> int:
