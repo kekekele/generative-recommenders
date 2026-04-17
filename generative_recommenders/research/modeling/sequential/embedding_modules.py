@@ -217,6 +217,9 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
             out_features=1,
             bias=True,
         )
+        self.register_buffer("_last_gate_mean", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("_last_gate_min", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("_last_gate_max", torch.tensor(0.0, dtype=torch.float32))
 
         self.reset_params()
 
@@ -252,7 +255,27 @@ class FourierGeoEmbeddingModule(EmbeddingModule):
         gate_input = torch.cat([item_emb, geo_delta], dim=-1)
         gate = self._geo_gate_max_scale * torch.sigmoid(self._geo_gate(gate_input))
         gate = gate.to(geo_delta.dtype) * valid_mask
+        gate_detached = gate.detach()
+        self._last_gate_mean.copy_(gate_detached.mean().to(torch.float32))
+        self._last_gate_min.copy_(gate_detached.min().to(torch.float32))
+        self._last_gate_max.copy_(gate_detached.max().to(torch.float32))
         return item_emb + gate * geo_delta
+
+    def get_gate_diagnostics(self) -> dict:
+        gate_bias = float(self._geo_gate.bias.detach().view(-1)[0].item())
+        gate_weight_norm = float(self._geo_gate.weight.detach().norm().item())
+        return {
+            "gate_bias": gate_bias,
+            "gate_weight_norm": gate_weight_norm,
+            "gate_last_mean": float(self._last_gate_mean.detach().item()),
+            "gate_last_min": float(self._last_gate_min.detach().item()),
+            "gate_last_max": float(self._last_gate_max.detach().item()),
+        }
+
+    def get_gate_scalar(self) -> float:
+        # A compact global proxy for gate strength.
+        gate_bias = self._geo_gate.bias.detach().view(-1)[0]
+        return float((self._geo_gate_max_scale * torch.sigmoid(gate_bias)).item())
 
     @property
     def item_embedding_dim(self) -> int:

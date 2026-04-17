@@ -443,6 +443,17 @@ def train_fn(
                     f" rank: {rank}, batch-stat (train): step {batch_id} "
                     f"(epoch {epoch} in {time.time() - last_training_time:.2f}s): {loss:.6f}"
                 )
+                if (
+                    embedding_module_type == "geo_fourier_only"
+                    and hasattr(model.module._embedding_module, "get_gate_scalar")
+                ):
+                    gate_scalar = model.module._embedding_module.get_gate_scalar()
+                    logging.info(
+                        " rank: %s, gate-stat: step %s gate=%.6f",
+                        rank,
+                        batch_id,
+                        gate_scalar,
+                    )
                 last_training_time = time.time()
                 if rank == 0:
                     assert writer is not None
