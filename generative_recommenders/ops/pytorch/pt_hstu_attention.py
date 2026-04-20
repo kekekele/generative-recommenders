@@ -16,6 +16,7 @@
 
 # pyre-strict
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -148,26 +149,6 @@ def pytorch_hstu_mha(
     q, k, v = _pad_qkv(
         q, k, v, seq_offsets, max_seq_len
     )  # [B, H, N, D) and [B, H, N, V]
-    qk_attn = torch.einsum("bhxa,bhya->bhxy", q, k) * alpha
-    if attn_scale is not None:
-        if attn_scale.ndim > 0:
-            attn_scale = (
-                torch.ops.fbgemm.jagged_to_padded_dense(
-                    values=attn_scale.unsqueeze(-1),
-                    offsets=[seq_offsets],
-                    max_lengths=[max_seq_len],
-                    padding_value=0.0,
-                )
-                .unsqueeze(1)
-                .to(qk_attn.dtype)
-            )
-        else:
-            # pyre-ignore[9]
-            attn_scale = attn_scale.item()
-
-        qk_attn = F.silu(qk_attn) * attn_scale
-    else:
-        qk_attn = F.silu(qk_attn) / max_seq_len
     valid_attn_mask = _get_valid_attn_mask(
         device=q.device,
         causal=causal,
@@ -178,11 +159,58 @@ def pytorch_hstu_mha(
         contextual_seq_len=contextual_seq_len,
         min_full_attn_seq_len=min_full_attn_seq_len,
     )
-    # raise NotImplementedError(valid_attn_mask[0, :, :].to(torch.int32))
-    qk_attn = qk_attn * valid_attn_mask.unsqueeze(1)
-    if dropout_pr > 0.0:
-        qk_attn = F.dropout(qk_attn, p=dropout_pr, training=training)
-    attn_dense = torch.einsum("bhxd,bhdv->bhxv", qk_attn, v)  # [B, H, N, V]
+
+    prepared_attn_scale = attn_scale
+    if prepared_attn_scale is not None and prepared_attn_scale.ndim > 0:
+        prepared_attn_scale = (
+            torch.ops.fbgemm.jagged_to_padded_dense(
+                values=prepared_attn_scale.unsqueeze(-1),
+                offsets=[seq_offsets],
+                max_lengths=[max_seq_len],
+                padding_value=0.0,
+            )
+            .unsqueeze(1)
+            .to(q.dtype)
+        )
+
+    # Chunked attention avoids materializing [B, H, N, N] in one shot.
+    chunk_size = int(os.environ.get("HSTU_ATTN_CHUNK_SIZE", "0"))
+    if chunk_size <= 0 and q.device.type == "npu":
+        chunk_size = 256
+
+    if chunk_size > 0 and chunk_size < max_seq_len:
+        chunks = []
+        for start in range(0, max_seq_len, chunk_size):
+            end = min(start + chunk_size, max_seq_len)
+            q_chunk = q[:, :, start:end, :]
+            qk_attn_chunk = torch.einsum("bhxa,bhya->bhxy", q_chunk, k) * alpha
+            if prepared_attn_scale is not None:
+                qk_attn_chunk = F.silu(qk_attn_chunk) * prepared_attn_scale[
+                    :, :, start:end, :
+                ]
+            else:
+                qk_attn_chunk = F.silu(qk_attn_chunk) / max_seq_len
+
+            qk_attn_chunk = qk_attn_chunk * valid_attn_mask[:, start:end, :].unsqueeze(1)
+            if dropout_pr > 0.0:
+                qk_attn_chunk = F.dropout(
+                    qk_attn_chunk,
+                    p=dropout_pr,
+                    training=training,
+                )
+            chunks.append(torch.einsum("bhxy,bhyv->bhxv", qk_attn_chunk, v))
+        attn_dense = torch.cat(chunks, dim=2)
+    else:
+        qk_attn = torch.einsum("bhxa,bhya->bhxy", q, k) * alpha
+        if prepared_attn_scale is not None:
+            qk_attn = F.silu(qk_attn) * prepared_attn_scale
+        else:
+            qk_attn = F.silu(qk_attn) / max_seq_len
+        qk_attn = qk_attn * valid_attn_mask.unsqueeze(1)
+        if dropout_pr > 0.0:
+            qk_attn = F.dropout(qk_attn, p=dropout_pr, training=training)
+        attn_dense = torch.einsum("bhxd,bhdv->bhxv", qk_attn, v)  # [B, H, N, V]
+
     return torch.ops.fbgemm.dense_to_jagged(
         attn_dense.transpose(1, 2).flatten(2, 3),  # [B, N, H, V]->[B, N, H * V]
         [seq_offsets],
