@@ -30,6 +30,32 @@ except OSError:
     pass
 
 
+def _get_chunk_size(default_chunk_size: int, device: torch.device, max_seq_len: int) -> int:
+    chunk_size = default_chunk_size
+    if chunk_size <= 0 and device.type == "npu":
+        chunk_size = 64
+    if chunk_size <= 0:
+        return chunk_size
+
+    # If the runtime exposes memory stats, use them to bias toward smaller chunks
+    # when the device is nearly full. This keeps the fallback path conservative.
+    if device.type == "npu" and hasattr(torch, "npu"):
+        try:
+            free_mem, total_mem = torch.npu.mem_get_info(device)  # pyre-ignore [16]
+            if total_mem > 0:
+                free_ratio = float(free_mem) / float(total_mem)
+                if free_ratio < 0.10:
+                    chunk_size = min(chunk_size, 16)
+                elif free_ratio < 0.20:
+                    chunk_size = min(chunk_size, 32)
+                elif free_ratio < 0.30:
+                    chunk_size = min(chunk_size, 48)
+        except Exception:
+            pass
+
+    return max(1, min(chunk_size, max_seq_len))
+
+
 @torch.fx.wrap
 def _get_valid_attn_mask(
     device: torch.device,
@@ -226,9 +252,11 @@ def pytorch_hstu_mha(
         )
 
     # Chunked attention avoids materializing [B, H, N, N] in one shot.
-    chunk_size = int(os.environ.get("HSTU_ATTN_CHUNK_SIZE", "0"))
-    if chunk_size <= 0 and q.device.type == "npu":
-        chunk_size = 256
+    chunk_size = _get_chunk_size(
+        default_chunk_size=int(os.environ.get("HSTU_ATTN_CHUNK_SIZE", "0")),
+        device=q.device,
+        max_seq_len=max_seq_len,
+    )
 
     if chunk_size > 0 and chunk_size < max_seq_len:
         k, v = _pad_kv(k, v, seq_offsets, max_seq_len)
@@ -256,7 +284,7 @@ def pytorch_hstu_mha(
             else:
                 qk_attn_chunk = F.silu(qk_attn_chunk) / max_seq_len
 
-            qk_attn_chunk = qk_attn_chunk * valid_attn_mask[:, start:end, :].unsqueeze(1)
+            qk_attn_chunk = qk_attn_chunk * valid_attn_mask.unsqueeze(1)
             if dropout_pr > 0.0:
                 qk_attn_chunk = F.dropout(
                     qk_attn_chunk,
