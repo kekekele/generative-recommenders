@@ -51,56 +51,54 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("utils")
 
 
-def _binary_auc(
+def _binary_roc_auc(
     predictions: torch.Tensor,
     labels: torch.Tensor,
-    weights: torch.Tensor,
-) -> float:
-    # Weighted ROC-AUC for binary labels. Samples with non-positive weights are ignored.
-    valid = weights > 0
-    if valid.sum().item() == 0:
-        return float("nan")
+    weights: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """
+    Compute weighted binary ROC-AUC for a single task.
 
-    y_score = predictions[valid].to(torch.float32)
-    y_true = labels[valid].to(torch.float32)
-    w = weights[valid].to(torch.float32)
+    Returns None when the batch has no positive or no negative examples.
+    """
+    if predictions.numel() == 0:
+        return None
 
-    pos_w = (w * y_true).sum()
-    neg_w = (w * (1.0 - y_true)).sum()
+    preds = predictions.reshape(-1).to(torch.float64)
+    lbls = labels.reshape(-1).to(torch.float64)
+    if weights is None:
+        wts = torch.ones_like(preds, dtype=torch.float64)
+    else:
+        wts = weights.reshape(-1).to(torch.float64)
+
+    valid = torch.logical_and(torch.isfinite(preds), torch.isfinite(lbls))
+    preds = preds[valid]
+    lbls = lbls[valid]
+    wts = wts[valid]
+    if preds.numel() == 0:
+        return None
+
+    pos_w = (lbls * wts).sum()
+    neg_w = ((1.0 - lbls) * wts).sum()
     if pos_w <= 0 or neg_w <= 0:
-        return float("nan")
+        return None
 
-    order = torch.argsort(y_score, descending=True)
-    y_true = y_true[order]
-    w = w[order]
+    sorted_idx = torch.argsort(preds, descending=True, stable=True)
+    y = lbls[sorted_idx]
+    w = wts[sorted_idx]
 
-    tpr = torch.cumsum(w * y_true, dim=0) / pos_w
-    fpr = torch.cumsum(w * (1.0 - y_true), dim=0) / neg_w
+    tp = torch.cumsum(y * w, dim=0)
+    fp = torch.cumsum((1.0 - y) * w, dim=0)
+
+    tpr = tp / pos_w
+    fpr = fp / neg_w
 
     zero = torch.zeros(1, dtype=tpr.dtype, device=tpr.device)
     tpr = torch.cat([zero, tpr], dim=0)
     fpr = torch.cat([zero, fpr], dim=0)
+
     auc = torch.trapz(tpr, fpr)
-    return float(auc.item())
-
-
-def _summarize_tensor_for_metrics(name: str, x: torch.Tensor) -> str:
-    x32 = x.detach().to(torch.float32)
-    finite = torch.isfinite(x32)
-    finite_ratio = float(finite.float().mean().item()) if x32.numel() > 0 else 1.0
-    if finite.any():
-        finite_vals = x32[finite]
-        min_v = float(finite_vals.min().item())
-        max_v = float(finite_vals.max().item())
-        mean_v = float(finite_vals.mean().item())
-    else:
-        min_v = float("nan")
-        max_v = float("nan")
-        mean_v = float("nan")
-    return (
-        f"{name}: shape={tuple(x.shape)} finite_ratio={finite_ratio:.6f} "
-        f"min={min_v:.6f} max={max_v:.6f} mean={mean_v:.6f}"
-    )
+    return auc.to(torch.float32)
 
 
 def _on_trace_ready_fn(
@@ -201,7 +199,7 @@ class MetricsLogger:
     """
     Logger for tracking and computing recommendation metrics.
 
-    Supports both classification metrics (NE, Accuracy, GAUC, AUC) and regression
+    Supports both classification metrics (NE, Accuracy, GAUC) and regression
     metrics (MSE, MAE) based on multitask configuration.
 
     Args:
@@ -221,6 +219,7 @@ class MetricsLogger:
         device: torch.device,
         rank: int,
         tensorboard_log_path: str = "",
+        enable_auc: bool = True,
     ) -> None:
         self.multitask_configs: List[TaskConfig] = multitask_configs
         all_classification_tasks: List[str] = [
@@ -228,7 +227,6 @@ class MetricsLogger:
             for task in self.multitask_configs
             if task.task_type != MultitaskTaskType.REGRESSION
         ]
-        self.classification_task_names: List[str] = all_classification_tasks
         all_regression_tasks: List[str] = [
             task.task_name
             for task in self.multitask_configs
@@ -238,6 +236,13 @@ class MetricsLogger:
             task.task_name for task in multitask_configs
         ]
         self.task_names: List[str] = all_classification_tasks + all_regression_tasks
+        self.classification_task_names: List[str] = all_classification_tasks
+        self.enable_auc: bool = enable_auc and len(all_classification_tasks) > 0
+        self._auc_max_rows: int = max(1, window_size * batch_size)
+        self._auc_buffer: Dict[str, Dict[str, List[torch.Tensor]]] = {
+            "train": {"predictions": [], "labels": [], "weights": []},
+            "eval": {"predictions": [], "labels": [], "weights": []},
+        }
 
         self.class_metrics: Dict[str, List[RecMetricComputation]] = {
             "train": [],
@@ -294,11 +299,6 @@ class MetricsLogger:
                 )
 
         self.global_step: Dict[str, int] = {"train": 0, "eval": 0}
-        # Store batch-wise tensors for AUC aggregation by mode.
-        self._auc_storage: Dict[str, Dict[str, List[torch.Tensor]]] = {
-            "train": {"predictions": [], "labels": [], "weights": []},
-            "eval": {"predictions": [], "labels": [], "weights": []},
-        }
         self.tb_logger: Optional[SummaryWriter] = None
         if tensorboard_log_path != "":
             self.tb_logger = SummaryWriter(log_dir=tensorboard_log_path, purge_step=0)
@@ -335,31 +335,6 @@ class MetricsLogger:
             num_candidates: Number of candidates per sample (for GAUC).
             mode: Either 'train' or 'eval'.
         """
-        if self.class_metrics[mode]:
-            preds32 = predictions.detach().to(torch.float32)
-            labels32 = labels.detach().to(torch.float32)
-            weights32 = weights.detach().to(torch.float32)
-
-            has_nonfinite = (
-                (not torch.isfinite(preds32).all())
-                or (not torch.isfinite(labels32).all())
-                or (not torch.isfinite(weights32).all())
-            )
-            out_of_range = bool(((preds32 < 0.0) | (preds32 > 1.0)).any().item())
-            sat_zero = float((preds32 <= 1e-12).float().mean().item())
-            sat_one = float((preds32 >= 1.0 - 1e-12).float().mean().item())
-            zero_weight_ratio = float((weights32 <= 0).float().mean().item())
-
-            if has_nonfinite or out_of_range or sat_zero > 0 or sat_one > 0:
-                logger.warning(
-                    f"{mode} - metric input anomaly detected: "
-                    f"pred_out_of_range={out_of_range} sat_zero={sat_zero:.6f} "
-                    f"sat_one={sat_one:.6f} zero_weight_ratio={zero_weight_ratio:.6f}"
-                )
-                logger.warning(_summarize_tensor_for_metrics("predictions", predictions))
-                logger.warning(_summarize_tensor_for_metrics("labels", labels))
-                logger.warning(_summarize_tensor_for_metrics("weights", weights))
-
         for metric in self.all_metrics[mode]:
             if isinstance(metric, GAUCMetricComputation):
                 metric.update(
@@ -375,11 +350,41 @@ class MetricsLogger:
                     weights=weights,
                 )
 
-        if self.class_metrics[mode]:
-            self._auc_storage[mode]["predictions"].append(predictions.detach().cpu())
-            self._auc_storage[mode]["labels"].append(labels.detach().cpu())
-            self._auc_storage[mode]["weights"].append(weights.detach().cpu())
+        if self.enable_auc:
+            n_cls = len(self.classification_task_names)
+            cls_predictions = predictions[:, :n_cls].detach().to(torch.float32).cpu()
+            cls_labels = labels[:, :n_cls].detach().to(torch.float32).cpu()
+            cls_weights = weights[:, :n_cls].detach().to(torch.float32).cpu()
+            self._auc_buffer[mode]["predictions"].append(cls_predictions)
+            self._auc_buffer[mode]["labels"].append(cls_labels)
+            self._auc_buffer[mode]["weights"].append(cls_weights)
+            self._trim_auc_buffer(mode)
+
         self.global_step[mode] += 1
+
+    def _trim_auc_buffer(self, mode: str) -> None:
+        while self._auc_buffer[mode]["predictions"]:
+            total_rows = sum(x.size(0) for x in self._auc_buffer[mode]["predictions"])
+            if total_rows <= self._auc_max_rows:
+                return
+            self._auc_buffer[mode]["predictions"].pop(0)
+            self._auc_buffer[mode]["labels"].pop(0)
+            self._auc_buffer[mode]["weights"].pop(0)
+
+    def _compute_auc_metrics(self, mode: str) -> Dict[str, float]:
+        if not self.enable_auc or len(self._auc_buffer[mode]["predictions"]) == 0:
+            return {}
+
+        preds = torch.cat(self._auc_buffer[mode]["predictions"], dim=0)
+        labels = torch.cat(self._auc_buffer[mode]["labels"], dim=0)
+        weights = torch.cat(self._auc_buffer[mode]["weights"], dim=0)
+        all_auc: Dict[str, float] = {}
+        for i, task_name in enumerate(self.classification_task_names):
+            auc = _binary_roc_auc(preds[:, i], labels[:, i], weights[:, i])
+            if auc is None:
+                continue
+            all_auc[f"metric/auc/{task_name}"] = float(auc.item())
+        return all_auc
 
     def compute(self, mode: str = "train") -> Dict[str, float]:
         """
@@ -401,51 +406,11 @@ class MetricsLogger:
                     key = f"metric/{str(computed.metric_prefix) + str(computed.name)}/{task_name}"
                     all_computed_metrics[key] = all_values[i]
 
-        if self.class_metrics[mode] and self._auc_storage[mode]["predictions"]:
-            preds = torch.cat(self._auc_storage[mode]["predictions"], dim=1)
-            labels = torch.cat(self._auc_storage[mode]["labels"], dim=1)
-            weights = torch.cat(self._auc_storage[mode]["weights"], dim=1)
-            num_classification_tasks = len(
-                [
-                    task
-                    for task in self.multitask_configs
-                    if task.task_type != MultitaskTaskType.REGRESSION
-                ]
-            )
-            for i in range(num_classification_tasks):
-                key = f"metric/auc/{self.task_names[i]}"
-                all_computed_metrics[key] = _binary_auc(
-                    predictions=preds[i],
-                    labels=labels[i],
-                    weights=weights[i],
-                )
+        all_computed_metrics.update(self._compute_auc_metrics(mode=mode))
 
         logger.info(
             f"{mode} - Step {self.global_step[mode]} metrics: {all_computed_metrics}"
         )
-        if self.classification_task_names:
-            summary_items: List[str] = []
-            for task_name in self.classification_task_names:
-                auc_value = all_computed_metrics.get(f"metric/auc/{task_name}", float("nan"))
-                gauc_value = float("nan")
-                for metric_name, metric_value in all_computed_metrics.items():
-                    lower_name = metric_name.lower()
-                    if "gauc" in lower_name and lower_name.endswith(f"/{task_name}"):
-                        gauc_value = float(metric_value)
-                        break
-
-                def _fmt(v: float) -> str:
-                    if v != v:
-                        return "nan"
-                    return f"{v:.6f}"
-
-                summary_items.append(
-                    f"{task_name}:AUC={_fmt(float(auc_value))},GAUC={_fmt(gauc_value)}"
-                )
-            logger.info(
-                f"{mode} - Step {self.global_step[mode]} AUC/GAUC summary: "
-                + " | ".join(summary_items)
-            )
         return all_computed_metrics
 
     def compute_and_log(
@@ -494,9 +459,7 @@ class MetricsLogger:
         """
         for metric in self.all_metrics[mode]:
             metric.reset()
-        self._auc_storage[mode]["predictions"] = []
-        self._auc_storage[mode]["labels"] = []
-        self._auc_storage[mode]["weights"] = []
+        self._auc_buffer[mode] = {"predictions": [], "labels": [], "weights": []}
 
 
 # the datasets we support
