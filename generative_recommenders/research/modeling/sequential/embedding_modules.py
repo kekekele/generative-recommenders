@@ -377,6 +377,104 @@ class FourierGeoConcatEmbeddingModule(EmbeddingModule):
         return self._item_embedding_dim
 
 
+class FourierGeoBudgetConcatEmbeddingModule(EmbeddingModule):
+    def __init__(
+        self,
+        num_items: int,
+        item_embedding_dim: int,
+        item_geo_fourier_features: torch.Tensor,
+        item_visit_time_features: torch.Tensor,
+        item_branch_dim: int,
+        geo_branch_dim: int,
+        visit_time_branch_dim: int,
+        branch_dropout_rate: float = 0.1,
+        residual_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        total_branch_dim = item_branch_dim + geo_branch_dim + visit_time_branch_dim
+        if total_branch_dim != item_embedding_dim:
+            raise ValueError(
+                "Budget concat branch dims must sum to item_embedding_dim: "
+                f"{item_branch_dim} + {geo_branch_dim} + {visit_time_branch_dim} "
+                f"!= {item_embedding_dim}"
+            )
+
+        self._item_embedding_dim: int = item_embedding_dim
+        self._residual_scale: float = residual_scale
+
+        self._item_emb: torch.nn.Embedding = torch.nn.Embedding(
+            num_items + 1,
+            item_embedding_dim,
+            padding_idx=0,
+        )
+        self.register_buffer(
+            "_item_geo_fourier_features",
+            item_geo_fourier_features.float(),
+        )
+        self.register_buffer("_item_visit_time_features", item_visit_time_features.float())
+
+        if item_geo_fourier_features.dim() != 2:
+            raise ValueError("item_geo_fourier_features must be rank-2 [num_items+1, dim]")
+        fourier_dim = item_geo_fourier_features.size(1)
+
+        self._item_branch: torch.nn.Module = torch.nn.Sequential(
+            torch.nn.Linear(item_embedding_dim, item_branch_dim, bias=True),
+            torch.nn.GELU(),
+            torch.nn.Dropout(branch_dropout_rate),
+        )
+        self._geo_branch: torch.nn.Module = torch.nn.Sequential(
+            torch.nn.Linear(fourier_dim, geo_branch_dim, bias=True),
+            torch.nn.GELU(),
+            torch.nn.Dropout(branch_dropout_rate),
+        )
+        self._visit_time_branch: torch.nn.Module = torch.nn.Sequential(
+            torch.nn.Linear(24, visit_time_branch_dim, bias=True),
+            torch.nn.GELU(),
+            torch.nn.Dropout(branch_dropout_rate),
+        )
+        self._output_norm: torch.nn.Module = torch.nn.LayerNorm(item_embedding_dim)
+
+        self.reset_params()
+
+    def debug_str(self) -> str:
+        return f"fourier_geo_budget_concat_res_emb_d{self._item_embedding_dim}"
+
+    def reset_params(self) -> None:
+        truncated_normal(self._item_emb.weight, mean=0.0, std=0.02)
+        for module in self.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+
+    def _safe_lookup(self, item_ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+        max_id = table.size(0) - 1
+        safe_ids = item_ids.clamp(min=0, max=max_id)
+        return table[safe_ids]
+
+    def get_item_embeddings(self, item_ids: torch.Tensor) -> torch.Tensor:
+        item_emb = self._item_emb(item_ids)
+
+        fourier_feat = self._safe_lookup(item_ids, self._item_geo_fourier_features)
+        visit_time_feat = self._safe_lookup(item_ids, self._item_visit_time_features)
+
+        item_h = self._item_branch(item_emb)
+        geo_h = self._geo_branch(fourier_feat)
+        visit_h = self._visit_time_branch(visit_time_feat)
+
+        fused_h = torch.cat([item_h, geo_h, visit_h], dim=-1)
+        fused_h = self._output_norm(fused_h)
+
+        valid_mask = (item_ids != 0).unsqueeze(-1).to(fused_h.dtype)
+        fused_h = fused_h * valid_mask
+        return item_emb + self._residual_scale * fused_h
+
+    @property
+    def item_embedding_dim(self) -> int:
+        return self._item_embedding_dim
+
+
 class CategoricalEmbeddingModule(EmbeddingModule):
     def __init__(
         self,

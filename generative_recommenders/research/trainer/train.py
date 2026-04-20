@@ -39,6 +39,7 @@ from generative_recommenders.research.modeling.sequential.autoregressive_losses 
 )
 from generative_recommenders.research.modeling.sequential.embedding_modules import (
     EmbeddingModule,
+    FourierGeoBudgetConcatEmbeddingModule,
     FourierGeoConcatEmbeddingModule,
     FourierGeoEmbeddingModule,
     GeoAwareEmbeddingModule,
@@ -131,6 +132,9 @@ def train_fn(
     fourier_seed: int = 42,
     concat_branch_dropout_rate: float = 0.1,
     concat_residual_scale: float = 0.1,
+    budget_concat_item_branch_dim: int = 0,
+    budget_concat_geo_branch_dim: int = 0,
+    budget_concat_visit_time_branch_dim: int = 0,
     geo_embedding_dim: int = 16,
     num_geo_regions: int = 4096,
     num_geo_cells_l5: int = 65536,
@@ -217,6 +221,25 @@ def train_fn(
             item_visit_time_features=dataset.item_visit_time_features,
             branch_dropout_rate=concat_branch_dropout_rate,
             use_item_residual_anchor=True,
+            residual_scale=concat_residual_scale,
+        )
+    elif embedding_module_type == "geo_fourier_budget_concat_residual":
+        item_branch_dim = budget_concat_item_branch_dim
+        geo_branch_dim = budget_concat_geo_branch_dim
+        visit_time_branch_dim = budget_concat_visit_time_branch_dim
+        if item_branch_dim <= 0 or geo_branch_dim <= 0 or visit_time_branch_dim <= 0:
+            item_branch_dim = item_embedding_dim // 2
+            geo_branch_dim = item_embedding_dim // 4
+            visit_time_branch_dim = item_embedding_dim - item_branch_dim - geo_branch_dim
+        embedding_module = FourierGeoBudgetConcatEmbeddingModule(
+            num_items=dataset.max_item_id,
+            item_embedding_dim=item_embedding_dim,
+            item_geo_fourier_features=dataset.item_geo_fourier_features,
+            item_visit_time_features=dataset.item_visit_time_features,
+            item_branch_dim=item_branch_dim,
+            geo_branch_dim=geo_branch_dim,
+            visit_time_branch_dim=visit_time_branch_dim,
+            branch_dropout_rate=concat_branch_dropout_rate,
             residual_scale=concat_residual_scale,
         )
     else:
