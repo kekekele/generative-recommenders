@@ -280,10 +280,17 @@ def _accumulate_attn_output(
         _, _, y2, vdim = v.shape
         torch._assert(y == y2, "qk_attn and v key dimension mismatch")
 
-        attn_flat = attn.view(b * h, x, vdim)
-        qk_flat = qk_attn.view(b * h, x, y)
-        v_flat = v.view(b * h, y, vdim)
-        attn_flat.baddbmm_(qk_flat, v_flat, beta=1.0, alpha=1.0)
+        # Avoid reshape/contiguous copies on non-contiguous NPU slices.
+        # Per-(batch, head) addmm_ keeps accumulation in-place with minimal
+        # temporary allocations.
+        for bi in range(b):
+            for hi in range(h):
+                attn[bi, hi].addmm_(
+                    qk_attn[bi, hi],
+                    v[bi, hi],
+                    beta=1.0,
+                    alpha=1.0,
+                )
 
 
 @torch.fx.wrap
