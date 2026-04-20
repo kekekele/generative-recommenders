@@ -41,14 +41,6 @@ from generative_recommenders.dlrm_v3.configs import (
 from generative_recommenders.dlrm_v3.datasets.dataset import collate_fn, Dataset
 from generative_recommenders.dlrm_v3.utils import get_dataset, MetricsLogger, Profiler
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTU, DlrmHSTUConfig
-from generative_recommenders.modules.ranking_gr_adapter import (
-    RankingAdapterConfig,
-    RankingGRAdapter,
-)
-from generative_recommenders.runtime.device import (
-    dist_backend_for_accelerator,
-    set_current_device,
-)
 from torch import distributed as dist
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
@@ -77,157 +69,17 @@ TORCHREC_TYPES: Set[Type[Union[EmbeddingBagCollection, EmbeddingCollection]]] = 
 }
 
 
-def _device_memory_snapshot(device: torch.device) -> str:
-    try:
-        if device.type == "cuda" and torch.cuda.is_available():
-            return (
-                f"cuda allocated={torch.cuda.memory_allocated(device)} "
-                f"reserved={torch.cuda.memory_reserved(device)} "
-                f"max_allocated={torch.cuda.max_memory_allocated(device)} "
-                f"max_reserved={torch.cuda.max_memory_reserved(device)}"
-            )
-        if (
-            device.type == "npu"
-            and hasattr(torch, "npu")
-            and torch.npu.is_available()  # pyre-ignore[16]
-        ):
-            allocated = (
-                torch.npu.memory_allocated(device)  # pyre-ignore[16]
-                if hasattr(torch.npu, "memory_allocated")  # pyre-ignore[16]
-                else -1
-            )
-            reserved = (
-                torch.npu.memory_reserved(device)  # pyre-ignore[16]
-                if hasattr(torch.npu, "memory_reserved")  # pyre-ignore[16]
-                else -1
-            )
-            max_allocated = (
-                torch.npu.max_memory_allocated(device)  # pyre-ignore[16]
-                if hasattr(torch.npu, "max_memory_allocated")  # pyre-ignore[16]
-                else -1
-            )
-            max_reserved = (
-                torch.npu.max_memory_reserved(device)  # pyre-ignore[16]
-                if hasattr(torch.npu, "max_memory_reserved")  # pyre-ignore[16]
-                else -1
-            )
-            return (
-                f"npu allocated={allocated} reserved={reserved} "
-                f"max_allocated={max_allocated} max_reserved={max_reserved}"
-            )
-    except Exception as e:
-        return f"memory_snapshot_error={repr(e)}"
-    return f"memory_snapshot_unavailable device={device}"
-
-
-def _log_step_debug_info(
-    loop_name: str,
-    step_idx: int,
-    device: torch.device,
-    sample: Any,
-    aux_losses: Dict[str, torch.Tensor],
-    mt_target_preds: Optional[torch.Tensor],
-    mt_target_labels: Optional[torch.Tensor],
-    mt_target_weights: Optional[torch.Tensor],
+def _validate_gradient_accumulation(
+    gradient_accumulation_steps: int,
+    strict_semantics: bool,
 ) -> None:
-    logger.info(
-        f"[{loop_name}] step={step_idx} device={device} mem_before={_device_memory_snapshot(device)}"
-    )
-    if mt_target_preds is not None:
-        logger.info(
-            f"[{loop_name}] preds shape={tuple(mt_target_preds.shape)} dtype={mt_target_preds.dtype} "
-            f"requires_grad={mt_target_preds.requires_grad}"
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be >= 1")
+    if strict_semantics and gradient_accumulation_steps != 1:
+        raise ValueError(
+            "strict_semantics=True requires gradient_accumulation_steps=1. "
+            "Set strict_semantics=False to enable gradient accumulation."
         )
-    if mt_target_labels is not None:
-        logger.info(
-            f"[{loop_name}] labels shape={tuple(mt_target_labels.shape)} dtype={mt_target_labels.dtype}"
-        )
-    if mt_target_weights is not None:
-        logger.info(
-            f"[{loop_name}] weights shape={tuple(mt_target_weights.shape)} dtype={mt_target_weights.dtype}"
-        )
-
-    for loss_name, loss_value in aux_losses.items():
-        detached = loss_value.detach()
-        logger.info(
-            f"[{loop_name}] aux_loss name={loss_name} shape={tuple(loss_value.shape)} "
-            f"dtype={loss_value.dtype} requires_grad={loss_value.requires_grad} "
-            f"value_mean={float(detached.float().mean().item()):.6f}"
-        )
-
-    try:
-        uih_lengths = sample.uih_features_kjt.lengths().view(
-            len(sample.uih_features_kjt.keys()), -1
-        )
-        cand_lengths = sample.candidates_features_kjt.lengths().view(
-            len(sample.candidates_features_kjt.keys()), -1
-        )
-        logger.info(
-            f"[{loop_name}] uih_lengths max={int(uih_lengths.max().item())} "
-            f"mean={float(uih_lengths.float().mean().item()):.2f}"
-        )
-        logger.info(
-            f"[{loop_name}] candidate_lengths max={int(cand_lengths.max().item())} "
-            f"mean={float(cand_lengths.float().mean().item()):.2f} "
-            f"num_candidates_batch={cand_lengths[0].tolist()}"
-        )
-    except Exception as e:
-        logger.warning(f"[{loop_name}] failed_to_log_lengths error={repr(e)}")
-
-
-def _run_backward_with_oom_logging(
-    loop_name: str,
-    step_idx: int,
-    device: torch.device,
-    sample: Any,
-    aux_losses: Dict[str, torch.Tensor],
-    mt_target_preds: Optional[torch.Tensor],
-    mt_target_labels: Optional[torch.Tensor],
-    mt_target_weights: Optional[torch.Tensor],
-) -> None:
-    if not aux_losses:
-        raise RuntimeError(f"[{loop_name}] aux_losses is empty, cannot run backward")
-    _log_step_debug_info(
-        loop_name=loop_name,
-        step_idx=step_idx,
-        device=device,
-        sample=sample,
-        aux_losses=aux_losses,
-        mt_target_preds=mt_target_preds,
-        mt_target_labels=mt_target_labels,
-        mt_target_weights=mt_target_weights,
-    )
-    try:
-        sum(aux_losses.values()).backward()
-    except RuntimeError as e:
-        err_msg = str(e).lower()
-        if "out of memory" in err_msg or "oom" in err_msg:
-            logger.error(
-                f"[{loop_name}] backward_oom step={step_idx} device={device} "
-                f"mem_after_exception={_device_memory_snapshot(device)}"
-            )
-            _log_step_debug_info(
-                loop_name=loop_name,
-                step_idx=step_idx,
-                device=device,
-                sample=sample,
-                aux_losses=aux_losses,
-                mt_target_preds=mt_target_preds,
-                mt_target_labels=mt_target_labels,
-                mt_target_weights=mt_target_weights,
-            )
-        raise
-
-
-def _all_aux_losses_finite(aux_losses: Dict[str, torch.Tensor]) -> bool:
-    return all(torch.isfinite(v).all().item() for v in aux_losses.values())
-
-
-def _has_nonfinite_grads(model: torch.nn.Module) -> bool:
-    for p in model.parameters():
-        if p.grad is not None and (not torch.isfinite(p.grad).all()):
-            return True
-    return False
 
 
 def setup(
@@ -235,25 +87,29 @@ def setup(
     world_size: int,
     master_port: int,
     device: torch.device,
-    accelerator: str,
+    backend: str = "nccl",
+    device_type: str = "cuda",
 ) -> dist.ProcessGroup:
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(master_port)
 
-    BACKEND = dist_backend_for_accelerator(accelerator)
     TIMEOUT = 1800
 
     # initialize the process group
     if not dist.is_initialized():
-        dist.init_process_group(BACKEND, rank=rank, world_size=world_size)
+        dist.init_process_group(backend, rank=rank, world_size=world_size)
 
     pg = dist.new_group(
-        backend=BACKEND,
+        backend=backend,
         timeout=timedelta(seconds=TIMEOUT),
     )
 
     # set device
-    set_current_device(device)
+    if device_type == "cuda":
+        torch.cuda.set_device(device)
+    elif device_type == "npu":
+        assert hasattr(torch, "npu"), "torch.npu is unavailable in current runtime"
+        torch.npu.set_device(device)  # pyre-ignore [16]
 
     return pg
 
@@ -330,39 +186,19 @@ class ChunkDistributedSampler(DistributedSampler[_T_co]):
 @gin.configurable
 def make_model(
     dataset: str,
-    model_variant: str = "dlrm_hstu",
-    bf16_training: bool = True,
-    ranking_prediction_head_arch: Tuple[int, ...] = (512, 1),
-    ranking_prediction_head_act_type: str = "relu",
-    ranking_prediction_head_bias: bool = True,
+    is_dense: bool = False,
+    model_device: Optional[torch.device] = None,
 ) -> Tuple[torch.nn.Module, DlrmHSTUConfig, Dict[str, EmbeddingConfig]]:
-    logger.info(
-        f"make_model dataset={dataset} model_variant={model_variant} bf16_training={bf16_training}"
-    )
     hstu_config = get_hstu_configs(dataset)
     table_config = get_embedding_table_config(dataset)
 
-    if model_variant == "dlrm_hstu":
-        model = DlrmHSTU(
-            hstu_configs=hstu_config,
-            embedding_tables=table_config,
-            is_inference=False,
-            bf16_training=bf16_training,
-        )
-    elif model_variant == "ranking_gr_adapter":
-        model = RankingGRAdapter(
-            hstu_configs=hstu_config,
-            embedding_tables=table_config,
-            is_inference=False,
-            bf16_training=bf16_training,
-            ranking_config=RankingAdapterConfig(
-                prediction_head_arch=ranking_prediction_head_arch,
-                prediction_head_act_type=ranking_prediction_head_act_type,
-                prediction_head_bias=ranking_prediction_head_bias,
-            ),
-        )
-    else:
-        raise ValueError(f"Unsupported model_variant: {model_variant}")
+    model = DlrmHSTU(
+        hstu_configs=hstu_config,
+        embedding_tables=table_config,
+        is_inference=False,
+        is_dense=is_dense,
+        embedding_device=model_device,
+    )
 
     return (
         model,
@@ -444,8 +280,9 @@ def make_optimizer_and_shard(
     model: torch.nn.Module,
     device: torch.device,
     world_size: int,
-    accelerator: str,
-) -> Tuple[DistributedModelParallel, torch.optim.Optimizer]:
+    use_model_parallel: bool = True,
+    compute_device: str = "cuda",
+) -> Tuple[torch.nn.Module, torch.optim.Optimizer]:
     dense_opt_cls, dense_opt_args, dense_opt_factory = (
         dense_optimizer_factory_and_class()
     )
@@ -454,35 +291,21 @@ def make_optimizer_and_shard(
         sparse_optimizer_factory_and_class()
     )
 
-    def _materialize_meta_embeddings(module: torch.nn.Module) -> None:
-        # Non-CUDA path does not use torchrec DMP sharding, so meta embedding tables
-        # must be explicitly materialized before model.to(device).
-        for submodule in module.modules():
-            if isinstance(submodule, (EmbeddingCollection, EmbeddingBagCollection)):
-                submodule.to_empty(device=device)
-                if hasattr(submodule, "reset_parameters"):
-                    submodule.reset_parameters()
-
-    # Non-CUDA accelerators fall back to plain optimizer path.
-    if accelerator != "cuda":
-        _materialize_meta_embeddings(model)
+    if not use_model_parallel:
         model = model.to(device)
-        sparse_param_names: Set[str] = set()
-        for module_name, module in model.named_modules():
-            if type(module) in TORCHREC_TYPES:
-                for param_name, param in module.named_parameters(prefix=module_name):
-                    if param.requires_grad:
-                        sparse_param_names.add(param_name)
+        del sparse_opt_cls, sparse_opt_args
 
-        dense_params: Dict[str, torch.Tensor] = {}
         sparse_params: Dict[str, torch.Tensor] = {}
-        for param_name, param in model.named_parameters():
+        dense_params: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if param_name in sparse_param_names:
-                sparse_params[param_name] = param
+            # Keep optimizer behavior close to TorchRec path: embedding collection
+            # parameters use sparse optimizer, all others use dense optimizer.
+            if "embedding_collection" in name:
+                sparse_params[name] = param
             else:
-                dense_params[param_name] = param
+                dense_params[name] = param
 
         all_optimizers = []
         if sparse_params:
@@ -507,7 +330,7 @@ def make_optimizer_and_shard(
             )
 
         optimizer = CombinedOptimizer(all_optimizers)
-        return model, optimizer  # pyre-ignore [7]
+        return model, optimizer
 
     # Fuse sparse optimizer to backward step
     for k, module in model.named_modules():
@@ -522,7 +345,7 @@ def make_optimizer_and_shard(
         topology=Topology(
             local_world_size=world_size,
             world_size=world_size,
-            compute_device=accelerator,
+            compute_device=compute_device,
             hbm_cap=160 * 1024 * 1024 * 1024,
             ddr_cap=32 * 1024 * 1024 * 1024,
         )
@@ -672,18 +495,24 @@ def train_loop(
     output_trace: bool = False,
     metric_log_frequency: int = 1,
     checkpoint_frequency: int = 100,
-    max_grad_norm: Optional[float] = None,
     start_batch_idx: int = 0,
+    gradient_accumulation_steps: int = 1,
+    strict_semantics: bool = True,
     # lr_scheduler: to-do: Add a scheduler
 ) -> None:
+    _validate_gradient_accumulation(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        strict_semantics=strict_semantics,
+    )
     model.train()
     batch_idx: int = start_batch_idx
     profiler = Profiler(rank, active=10) if output_trace else None
+    accumulation_step: int = 0
+    optimizer.zero_grad()
 
     for epoch in range(num_epochs):
         dataloader.sampler.set_epoch(epoch)  # pyre-ignore [16]
         for sample in dataloader:
-            optimizer.zero_grad()
             sample.to(device)
             (
                 _,
@@ -696,49 +525,19 @@ def train_loop(
                 sample.uih_features_kjt,
                 sample.candidates_features_kjt,
             )
-            if not _all_aux_losses_finite(aux_losses):
-                logger.error(
-                    f"[train_loop] non-finite aux_losses at step={batch_idx}; skipping optimizer step"
-                )
-                for loss_name, loss_value in aux_losses.items():
-                    logger.error(
-                        f"[train_loop] aux_loss {loss_name} finite_ratio="
-                        f"{float(torch.isfinite(loss_value).float().mean().item()):.6f}"
-                    )
-                continue
-            _run_backward_with_oom_logging(
-                loop_name="train_loop",
-                step_idx=batch_idx,
-                device=device,
-                sample=sample,
-                aux_losses=aux_losses,
-                mt_target_preds=mt_target_preds,
-                mt_target_labels=mt_target_labels,
-                mt_target_weights=mt_target_weights,
-            )
-            if max_grad_norm is not None and max_grad_norm > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=max_grad_norm
-                )
-                if not torch.isfinite(grad_norm):
-                    logger.error(
-                        f"[train_loop] non-finite grad_norm={float(grad_norm):.6f} "
-                        f"at step={batch_idx}; skipping optimizer step"
-                    )
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-            if _has_nonfinite_grads(model):
-                logger.error(
-                    f"[train_loop] non-finite gradients at step={batch_idx}; skipping optimizer step"
-                )
-                optimizer.zero_grad(set_to_none=True)
-                continue
-            optimizer.step()
+            loss = sum(aux_losses.values())
+            (loss / gradient_accumulation_steps).backward()
+            accumulation_step += 1
+            should_step = accumulation_step == gradient_accumulation_steps
+            if should_step:
+                optimizer.step()
+                optimizer.zero_grad()
+                accumulation_step = 0
             metric_logger.update(
                 mode="train",
-                predictions=mt_target_preds.detach(),
-                labels=mt_target_labels.detach(),
-                weights=mt_target_weights.detach(),
+                predictions=mt_target_preds,
+                labels=mt_target_labels,
+                weights=mt_target_weights,
                 num_candidates=sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0],
@@ -766,6 +565,9 @@ def train_loop(
                 break
         if num_batches is not None and batch_idx >= num_batches:
             break
+    if accumulation_step > 0:
+        optimizer.step()
+        optimizer.zero_grad()
 
 
 @gin.configurable
@@ -800,9 +602,9 @@ def eval_loop(
             )
             metric_logger.update(
                 mode="eval",
-                predictions=mt_target_preds.detach(),
-                labels=mt_target_labels.detach(),
-                weights=mt_target_weights.detach(),
+                predictions=mt_target_preds,
+                labels=mt_target_labels,
+                weights=mt_target_weights,
                 num_candidates=sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0],
@@ -836,17 +638,24 @@ def train_eval_loop(
     metric_log_frequency: int = 1,
     checkpoint_frequency: int = 100,
     eval_frequency: int = 1,
-    max_grad_norm: Optional[float] = None,
     start_train_batch_idx: int = 0,
     start_eval_batch_idx: int = 0,
+    gradient_accumulation_steps: int = 1,
+    strict_semantics: bool = True,
     # lr_scheduler: to-do: Add a scheduler
 ) -> None:
+    _validate_gradient_accumulation(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        strict_semantics=strict_semantics,
+    )
     train_batch_idx: int = start_train_batch_idx
     eval_batch_idx: int = start_eval_batch_idx
     profiler = Profiler(rank, active=10) if output_trace else None
     assert train_dataloader is not None and eval_dataloader is not None
     eval_data_iterator = iter(eval_dataloader)
     train_data_iterator = iter(train_dataloader)
+    accumulation_step: int = 0
+    optimizer.zero_grad()
     # metric_logger.reset(mode="train")
     # metric_logger.reset(mode="eval")
 
@@ -859,7 +668,6 @@ def train_eval_loop(
             except StopIteration:
                 train_data_iterator = iter(train_dataloader)
                 break
-            optimizer.zero_grad()
             sample.to(device)
             (
                 _,
@@ -872,49 +680,19 @@ def train_eval_loop(
                 sample.uih_features_kjt,
                 sample.candidates_features_kjt,
             )
-            if not _all_aux_losses_finite(aux_losses):
-                logger.error(
-                    f"[train_eval_loop] non-finite aux_losses at step={train_batch_idx}; skipping optimizer step"
-                )
-                for loss_name, loss_value in aux_losses.items():
-                    logger.error(
-                        f"[train_eval_loop] aux_loss {loss_name} finite_ratio="
-                        f"{float(torch.isfinite(loss_value).float().mean().item()):.6f}"
-                    )
-                continue
-            _run_backward_with_oom_logging(
-                loop_name="train_eval_loop",
-                step_idx=train_batch_idx,
-                device=device,
-                sample=sample,
-                aux_losses=aux_losses,
-                mt_target_preds=mt_target_preds,
-                mt_target_labels=mt_target_labels,
-                mt_target_weights=mt_target_weights,
-            )
-            if max_grad_norm is not None and max_grad_norm > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=max_grad_norm
-                )
-                if not torch.isfinite(grad_norm):
-                    logger.error(
-                        f"[train_eval_loop] non-finite grad_norm={float(grad_norm):.6f} "
-                        f"at step={train_batch_idx}; skipping optimizer step"
-                    )
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-            if _has_nonfinite_grads(model):
-                logger.error(
-                    f"[train_eval_loop] non-finite gradients at step={train_batch_idx}; skipping optimizer step"
-                )
-                optimizer.zero_grad(set_to_none=True)
-                continue
-            optimizer.step()
+            loss = sum(aux_losses.values())
+            (loss / gradient_accumulation_steps).backward()
+            accumulation_step += 1
+            should_step = accumulation_step == gradient_accumulation_steps
+            if should_step:
+                optimizer.step()
+                optimizer.zero_grad()
+                accumulation_step = 0
             metric_logger.update(
                 mode="train",
-                predictions=mt_target_preds.detach(),
-                labels=mt_target_labels.detach(),
-                weights=mt_target_weights.detach(),
+                predictions=mt_target_preds,
+                labels=mt_target_labels,
+                weights=mt_target_weights,
                 num_candidates=sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0],
@@ -938,10 +716,9 @@ def train_eval_loop(
             if output_trace:
                 assert profiler is not None
                 profiler.step()
-            if train_batch_idx % eval_frequency == 0:
+            if train_batch_idx % eval_frequency == 0 and accumulation_step == 0:
                 model.eval()
                 eval_batch_idx: int = 0
-                metric_logger.reset(mode="eval")
                 with torch.no_grad():
                     while True:
                         try:
@@ -963,9 +740,9 @@ def train_eval_loop(
                         )
                         metric_logger.update(
                             mode="eval",
-                            predictions=mt_target_preds.detach(),
-                            labels=mt_target_labels.detach(),
-                            weights=mt_target_weights.detach(),
+                            predictions=mt_target_preds,
+                            labels=mt_target_labels,
+                            weights=mt_target_weights,
                             num_candidates=sample.candidates_features_kjt.lengths().view(
                                 len(sample.candidates_features_kjt.keys()), -1
                             )[0],
@@ -986,6 +763,9 @@ def train_eval_loop(
                 model.train()
             if num_train_batches is not None and train_batch_idx >= num_train_batches:
                 break
+    if accumulation_step > 0:
+        optimizer.step()
+        optimizer.zero_grad()
 
 
 @gin.configurable
@@ -1003,16 +783,23 @@ def streaming_train_eval_loop(
     output_trace: bool = False,
     metric_log_frequency: int = 1,
     checkpoint_frequency: int = 100,
-    max_grad_norm: Optional[float] = None,
+    gradient_accumulation_steps: int = 1,
+    strict_semantics: bool = True,
 ) -> None:
+    _validate_gradient_accumulation(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        strict_semantics=strict_semantics,
+    )
     profiler = Profiler(rank, active=10) if output_trace else None
     dataset_class, kwargs = get_dataset()
     kwargs["embedding_config"] = embedding_table_configs
     dataset = HammerToTorchDataset(
         dataset=dataset_class(hstu_config=hstu_config, is_inference=False, **kwargs)
     )
+    optimizer.zero_grad()
     for train_ts in range(num_train_ts):
         train_batch_idx: int = 0
+        accumulation_step: int = 0
         train_dataloader = make_streaming_dataloader(dataset=dataset, ts=train_ts)
         train_data_iterator = iter(train_dataloader)
         while True:
@@ -1021,7 +808,6 @@ def streaming_train_eval_loop(
                 sample = next(train_data_iterator)
             except StopIteration:
                 break
-            optimizer.zero_grad()
             sample.to(device)
             (
                 _,
@@ -1034,49 +820,19 @@ def streaming_train_eval_loop(
                 sample.uih_features_kjt,
                 sample.candidates_features_kjt,
             )
-            if not _all_aux_losses_finite(aux_losses):
-                logger.error(
-                    f"[streaming_train_eval_loop] non-finite aux_losses at step={train_batch_idx}; skipping optimizer step"
-                )
-                for loss_name, loss_value in aux_losses.items():
-                    logger.error(
-                        f"[streaming_train_eval_loop] aux_loss {loss_name} finite_ratio="
-                        f"{float(torch.isfinite(loss_value).float().mean().item()):.6f}"
-                    )
-                continue
-            _run_backward_with_oom_logging(
-                loop_name="streaming_train_eval_loop",
-                step_idx=train_batch_idx,
-                device=device,
-                sample=sample,
-                aux_losses=aux_losses,
-                mt_target_preds=mt_target_preds,
-                mt_target_labels=mt_target_labels,
-                mt_target_weights=mt_target_weights,
-            )
-            if max_grad_norm is not None and max_grad_norm > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=max_grad_norm
-                )
-                if not torch.isfinite(grad_norm):
-                    logger.error(
-                        f"[streaming_train_eval_loop] non-finite grad_norm={float(grad_norm):.6f} "
-                        f"at step={train_batch_idx}; skipping optimizer step"
-                    )
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-            if _has_nonfinite_grads(model):
-                logger.error(
-                    f"[streaming_train_eval_loop] non-finite gradients at step={train_batch_idx}; skipping optimizer step"
-                )
-                optimizer.zero_grad(set_to_none=True)
-                continue
-            optimizer.step()
+            loss = sum(aux_losses.values())
+            (loss / gradient_accumulation_steps).backward()
+            accumulation_step += 1
+            should_step = accumulation_step == gradient_accumulation_steps
+            if should_step:
+                optimizer.step()
+                optimizer.zero_grad()
+                accumulation_step = 0
             metric_logger.update(
                 mode="train",
-                predictions=mt_target_preds.detach(),
-                labels=mt_target_labels.detach(),
-                weights=mt_target_weights.detach(),
+                predictions=mt_target_preds,
+                labels=mt_target_labels,
+                weights=mt_target_weights,
                 num_candidates=sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0],
@@ -1094,6 +850,9 @@ def streaming_train_eval_loop(
                 profiler.step()
             if num_train_batches is not None and train_batch_idx >= num_train_batches:
                 break
+        if accumulation_step > 0:
+            optimizer.step()
+            optimizer.zero_grad()
         eval_ts = train_ts + 1
         dataset.dataset.is_eval = True  # pyre-ignore [16]
         model.eval()
@@ -1120,9 +879,9 @@ def streaming_train_eval_loop(
                 )
                 metric_logger.update(
                     mode="eval",
-                    predictions=mt_target_preds.detach(),
-                    labels=mt_target_labels.detach(),
-                    weights=mt_target_weights.detach(),
+                    predictions=mt_target_preds,
+                    labels=mt_target_labels,
+                    weights=mt_target_weights,
                     num_candidates=sample.candidates_features_kjt.lengths().view(
                         len(sample.candidates_features_kjt.keys()), -1
                     )[0],
@@ -1174,9 +933,9 @@ def streaming_train_eval_loop(
             )
             metric_logger.update(
                 mode="eval",
-                predictions=mt_target_preds.detach(),
-                labels=mt_target_labels.detach(),
-                weights=mt_target_weights.detach(),
+                predictions=mt_target_preds,
+                labels=mt_target_labels,
+                weights=mt_target_weights,
                 num_candidates=sample.candidates_features_kjt.lengths().view(
                     len(sample.candidates_features_kjt.keys()), -1
                 )[0],

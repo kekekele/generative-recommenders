@@ -1053,6 +1053,11 @@ def smoke_test_geo_aware_pipeline():
 
     negatives_sampler = LocalNegativesSampler(
         num_items=dataset.max_item_id,
+        RECALL_ITEM_GEO_ADAPTATION_PLAN.md
+        
+        如果你愿意，我可以再给这一段补一个“更紧凑版”（单屏宽度更友好）的文本流程图样式。
+        
+        
         embedding_module=embedding_module,
         all_item_ids=dataset.all_item_ids,
         l2_norm=True,
