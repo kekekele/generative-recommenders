@@ -69,6 +69,19 @@ def _get_key_chunk_size(
     return max(1, min(key_chunk_size, key_len))
 
 
+def _get_batch_chunk_size(
+    default_batch_chunk_size: int,
+    device: torch.device,
+    batch_size: int,
+) -> int:
+    batch_chunk_size = default_batch_chunk_size
+    if batch_chunk_size <= 0 and device.type == "npu":
+        batch_chunk_size = 2
+    if batch_chunk_size <= 0:
+        return batch_chunk_size
+    return max(1, min(batch_chunk_size, batch_size))
+
+
 @torch.fx.wrap
 def _get_valid_attn_mask(
     device: torch.device,
@@ -327,34 +340,92 @@ def pytorch_hstu_mha(
                 device=q.device,
                 key_len=k_chunk.size(2),
             )
+            batch_chunk_size = _get_batch_chunk_size(
+                default_batch_chunk_size=int(
+                    os.environ.get("HSTU_ATTN_BATCH_CHUNK_SIZE", "0")
+                ),
+                device=q.device,
+                batch_size=q_chunk.size(0),
+            )
 
             # For dropout-enabled attention, keep the original code path to avoid
             # changing randomness behavior.
             if key_chunk_size > 0 and key_chunk_size < k_chunk.size(2) and dropout_pr == 0.0:
-                attn_chunk = torch.zeros(
-                    (q_chunk.size(0), q_chunk.size(1), q_chunk.size(2), v_chunk.size(3)),
-                    device=q_chunk.device,
-                    dtype=q_chunk.dtype,
-                )
                 scale_slice = (
                     prepared_attn_scale[:, :, start:end, :]
                     if prepared_attn_scale is not None
                     else None
                 )
-                for key_start in range(0, k_chunk.size(2), key_chunk_size):
-                    key_end = min(key_start + key_chunk_size, k_chunk.size(2))
-                    k_sub = k_chunk[:, :, key_start:key_end, :]
-                    v_sub = v_chunk[:, :, key_start:key_end, :]
-                    mask_sub = valid_attn_mask[:, :, key_start:key_end]
+                if batch_chunk_size > 0 and batch_chunk_size < q_chunk.size(0):
+                    attn_parts = []
+                    for b_start in range(0, q_chunk.size(0), batch_chunk_size):
+                        b_end = min(b_start + batch_chunk_size, q_chunk.size(0))
+                        q_b = q_chunk[b_start:b_end]
+                        attn_b = torch.zeros(
+                            (q_b.size(0), q_b.size(1), q_b.size(2), v_chunk.size(3)),
+                            device=q_b.device,
+                            dtype=q_b.dtype,
+                        )
+                        scale_b = (
+                            scale_slice[b_start:b_end] if scale_slice is not None else None
+                        )
+                        for key_start in range(0, k_chunk.size(2), key_chunk_size):
+                            key_end = min(key_start + key_chunk_size, k_chunk.size(2))
+                            k_sub = k_chunk[b_start:b_end, :, key_start:key_end, :]
+                            v_sub = v_chunk[b_start:b_end, :, key_start:key_end, :]
+                            mask_sub = valid_attn_mask[
+                                b_start:b_end,
+                                :,
+                                key_start:key_end,
+                            ]
 
-                    qk_attn_sub = torch.einsum("bhxa,bhya->bhxy", q_chunk, k_sub) * alpha
-                    if scale_slice is not None:
-                        qk_attn_sub = F.silu(qk_attn_sub) * scale_slice
-                    else:
-                        qk_attn_sub = F.silu(qk_attn_sub) / max_seq_len
+                            qk_attn_sub = (
+                                torch.einsum("bhxa,bhya->bhxy", q_b, k_sub) * alpha
+                            )
+                            if scale_b is not None:
+                                qk_attn_sub = F.silu(qk_attn_sub) * scale_b
+                            else:
+                                qk_attn_sub = F.silu(qk_attn_sub) / max_seq_len
 
-                    qk_attn_sub = qk_attn_sub * mask_sub.unsqueeze(1)
-                    attn_chunk = attn_chunk + torch.einsum("bhxy,bhyv->bhxv", qk_attn_sub, v_sub)
+                            qk_attn_sub = qk_attn_sub * mask_sub.unsqueeze(1)
+                            attn_b = attn_b + torch.einsum(
+                                "bhxy,bhyv->bhxv",
+                                qk_attn_sub,
+                                v_sub,
+                            )
+                        attn_parts.append(attn_b)
+                    attn_chunk = torch.cat(attn_parts, dim=0)
+                else:
+                    attn_chunk = torch.zeros(
+                        (
+                            q_chunk.size(0),
+                            q_chunk.size(1),
+                            q_chunk.size(2),
+                            v_chunk.size(3),
+                        ),
+                        device=q_chunk.device,
+                        dtype=q_chunk.dtype,
+                    )
+                    for key_start in range(0, k_chunk.size(2), key_chunk_size):
+                        key_end = min(key_start + key_chunk_size, k_chunk.size(2))
+                        k_sub = k_chunk[:, :, key_start:key_end, :]
+                        v_sub = v_chunk[:, :, key_start:key_end, :]
+                        mask_sub = valid_attn_mask[:, :, key_start:key_end]
+
+                        qk_attn_sub = (
+                            torch.einsum("bhxa,bhya->bhxy", q_chunk, k_sub) * alpha
+                        )
+                        if scale_slice is not None:
+                            qk_attn_sub = F.silu(qk_attn_sub) * scale_slice
+                        else:
+                            qk_attn_sub = F.silu(qk_attn_sub) / max_seq_len
+
+                        qk_attn_sub = qk_attn_sub * mask_sub.unsqueeze(1)
+                        attn_chunk = attn_chunk + torch.einsum(
+                            "bhxy,bhyv->bhxv",
+                            qk_attn_sub,
+                            v_sub,
+                        )
                 chunks.append(attn_chunk)
             else:
                 qk_attn_chunk = torch.einsum("bhxa,bhya->bhxy", q_chunk, k_chunk) * alpha
