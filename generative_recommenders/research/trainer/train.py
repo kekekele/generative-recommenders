@@ -39,6 +39,7 @@ from generative_recommenders.research.modeling.sequential.autoregressive_losses 
 )
 from generative_recommenders.research.modeling.sequential.embedding_modules import (
     EmbeddingModule,
+    FourierGeoConcatEmbeddingModule,
     FourierGeoEmbeddingModule,
     GeoAwareEmbeddingModule,
     LocalEmbeddingModule,
@@ -128,6 +129,8 @@ def train_fn(
     fourier_num_bands: int = 64,
     fourier_scale: float = 10.0,
     fourier_seed: int = 42,
+    concat_branch_dropout_rate: float = 0.1,
+    concat_residual_scale: float = 0.1,
     geo_embedding_dim: int = 16,
     num_geo_regions: int = 4096,
     num_geo_cells_l5: int = 65536,
@@ -195,6 +198,26 @@ def train_fn(
             item_embedding_dim=item_embedding_dim,
             item_geo_fourier_features=dataset.item_geo_fourier_features,
             item_visit_time_features=dataset.item_visit_time_features,
+        )
+    elif embedding_module_type == "geo_fourier_concat_a":
+        embedding_module = FourierGeoConcatEmbeddingModule(
+            num_items=dataset.max_item_id,
+            item_embedding_dim=item_embedding_dim,
+            item_geo_fourier_features=dataset.item_geo_fourier_features,
+            item_visit_time_features=dataset.item_visit_time_features,
+            branch_dropout_rate=concat_branch_dropout_rate,
+            use_item_residual_anchor=False,
+            residual_scale=concat_residual_scale,
+        )
+    elif embedding_module_type == "geo_fourier_concat_b":
+        embedding_module = FourierGeoConcatEmbeddingModule(
+            num_items=dataset.max_item_id,
+            item_embedding_dim=item_embedding_dim,
+            item_geo_fourier_features=dataset.item_geo_fourier_features,
+            item_visit_time_features=dataset.item_visit_time_features,
+            branch_dropout_rate=concat_branch_dropout_rate,
+            use_item_residual_anchor=True,
+            residual_scale=concat_residual_scale,
         )
     else:
         raise ValueError(f"Unknown embedding_module_type {embedding_module_type}")

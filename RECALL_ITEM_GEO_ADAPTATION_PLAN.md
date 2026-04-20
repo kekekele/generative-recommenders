@@ -919,6 +919,56 @@ class LocalNegativesSampler(NegativesSampler):
 
 目标：在训练入口切换 embedding module。
 
+## FourierGeo Three Variants (Visualization)
+
+下面是目前已尝试的 3 种 `FourierGeo` 加载/融合方式的可视化对比。
+
+公共主干（3 个 Variant 共用）：
+
+- item_id -> item_emb: D
+
+Variant-1: Online Random Fourier
+
+- item_geo_fourier_features.csv (lat_norm/lon_norm)
+    -> Runtime Random Fourier Mapping
+    -> concat with visit_time(24)
+    -> Linear -> LayerNorm -> geo_delta(D)
+- 融合: item_emb + geo_delta
+
+Variant-2: Offline Deterministic Fourier + Fixed Scale
+
+- item_geo_fourier_features.csv (geo_fourier_0..127)
+    -> Lookup 128-d vector
+    -> concat with visit_time(24)
+    -> Linear -> geo_delta(D)
+- 融合: item_emb + 0.05 * geo_delta
+
+Variant-3: Offline Deterministic Fourier + Adaptive Gate
+
+- item_geo_fourier_features.csv (geo_fourier_0..127)
+    -> Lookup 128-d vector
+    -> concat with visit_time(24)
+    -> Linear -> geo_delta(D)
+- 门控分支: gate_input = concat(item_emb, geo_delta)
+    -> gate = 0.2 * sigmoid(Linear)
+- 融合: item_emb + gate * geo_delta
+
+### Variant Summary
+
+| Variant | Geo feature source | Fusion form | Key risk / behavior |
+|---|---|---|---|
+| V1 | 在线由 `lat_norm/lon_norm` 运行时映射 | `Linear -> LayerNorm -> residual add` | geo 分支幅度过强，容易压过 item 主语义 |
+| V2 | 离线预计算 `geo_fourier_0..127` | `Linear -> residual add` with fixed `0.05` | 更稳定，作为弱修正项，易于对照验证 |
+| V3 | 离线预计算 `geo_fourier_0..127` | `Linear -> gated residual add` (`gate<=0.2`) | 自适应更强，但需要监控 gate 是否过大 |
+
+### Current Recommendation
+
+1. 先以 `V2` 作为稳态 baseline（固定比例，稳定可复现）。
+2. 再用 `V3` 做 10-20 epoch 的短程 A/B，观察是否持续优于 `V2`。
+3. 对 `V3` 重点看 gate 日志趋势：
+     - 长期接近 0：geo 信号未被有效利用
+     - 快速接近上限：geo 可能重新变成过强分支
+
 ```python
 @gin.configurable
 def train_fn(
