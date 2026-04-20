@@ -263,6 +263,29 @@ def _get_chunk_column_range(
     return col_start, col_end
 
 
+def _accumulate_attn_output(
+        attn: torch.Tensor,
+        qk_attn: torch.Tensor,
+        v: torch.Tensor,
+) -> None:
+        """
+        In-place accumulate attn += einsum('bhxy,bhyv->bhxv', qk_attn, v)
+        using baddbmm_ to minimize temporary allocations.
+        Shapes:
+            attn:    [B, H, X, V]
+            qk_attn: [B, H, X, Y]
+            v:       [B, H, Y, V]
+        """
+        b, h, x, y = qk_attn.shape
+        _, _, y2, vdim = v.shape
+        torch._assert(y == y2, "qk_attn and v key dimension mismatch")
+
+        attn_flat = attn.view(b * h, x, vdim)
+        qk_flat = qk_attn.view(b * h, x, y)
+        v_flat = v.view(b * h, y, vdim)
+        attn_flat.baddbmm_(qk_flat, v_flat, beta=1.0, alpha=1.0)
+
+
 @torch.fx.wrap
 def pytorch_hstu_mha(
     max_seq_len: int,
@@ -397,11 +420,11 @@ def pytorch_hstu_mha(
                                 qk_attn_sub = F.silu(qk_attn_sub) / max_seq_len
 
                             qk_attn_sub = qk_attn_sub * mask_sub.unsqueeze(1)
-                            attn_b.add_(torch.einsum(
-                                "bhxy,bhyv->bhxv",
-                                qk_attn_sub,
-                                v_sub,
-                            ))
+                            _accumulate_attn_output(
+                                attn=attn_b,
+                                qk_attn=qk_attn_sub,
+                                v=v_sub,
+                            )
                         attn_chunk[b_start:b_end] = attn_b
                 else:
                     attn_chunk = torch.zeros(
@@ -429,11 +452,11 @@ def pytorch_hstu_mha(
                             qk_attn_sub = F.silu(qk_attn_sub) / max_seq_len
 
                         qk_attn_sub = qk_attn_sub * mask_sub.unsqueeze(1)
-                        attn_chunk.add_(torch.einsum(
-                            "bhxy,bhyv->bhxv",
-                            qk_attn_sub,
-                            v_sub,
-                        ))
+                        _accumulate_attn_output(
+                            attn=attn_chunk,
+                            qk_attn=qk_attn_sub,
+                            v=v_sub,
+                        )
                 chunks.append(attn_chunk)
             else:
                 qk_attn_chunk = torch.einsum("bhxa,bhya->bhxy", q_chunk, k_chunk) * alpha
