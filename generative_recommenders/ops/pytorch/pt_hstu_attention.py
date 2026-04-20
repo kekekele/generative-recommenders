@@ -40,38 +40,40 @@ def _get_valid_attn_mask(
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
     min_full_attn_seq_len: int = 0,
+    row_start: int = 0,
+    row_end: Optional[int] = None,
 ) -> torch.Tensor:
+    if row_end is None:
+        row_end = N
+
     ids = torch.arange(0, N, device=device).view(1, N)
-    max_ids = seq_lengths.view(-1, 1, 1)
+    max_ids = seq_lengths.view(-1, 1)
     if contextual_seq_len > 0:
         ids = ids - contextual_seq_len + 1
         ids = torch.clamp(ids, min=0)
         max_ids = max_ids - contextual_seq_len + 1
+
     if num_targets is not None:
-        max_ids = max_ids - num_targets.view(-1, 1, 1)
-        ids = torch.clamp(
-            ids,
-            max=max_ids,
-        )
-        row_ids = ids.view(-1, N, 1).expand(-1, N, N)
-        col_ids = ids.view(-1, 1, N).expand(-1, N, N)
+        max_ids = max_ids - num_targets.view(-1, 1)
+        ids = torch.clamp(ids.expand(max_ids.size(0), -1), max=max_ids)
     else:
-        row_ids = ids.view(N, 1).expand(N, N)
-        col_ids = row_ids.t()
-        row_ids = row_ids.view(1, N, N)
-        col_ids = col_ids.view(1, N, N)
+        ids = ids
+
+    row_ids = ids[:, row_start:row_end].unsqueeze(-1)
+    col_ids = ids.unsqueeze(1)
     row_col_dist = row_ids - col_ids
-    valid_attn_mask = torch.eye(N, device=device, dtype=torch.bool).view(1, N, N)
+    valid_attn_mask = row_ids == col_ids
     if not causal:
         row_col_dist = torch.where(row_col_dist > 0, row_col_dist, -row_col_dist)
     valid_attn_mask = torch.logical_or(valid_attn_mask, row_col_dist > 0)
     if max_attn_len > 0:
         if min_full_attn_seq_len > 0:
+            max_ids_3d = max_ids.unsqueeze(1)
             valid_attn_mask = torch.logical_and(
                 valid_attn_mask,
                 torch.logical_or(
                     row_col_dist <= max_attn_len,
-                    row_ids >= max_ids - min_full_attn_seq_len,
+                    row_ids >= max_ids_3d - min_full_attn_seq_len,
                 ),
             )
         else:
@@ -79,8 +81,10 @@ def _get_valid_attn_mask(
                 valid_attn_mask, row_col_dist <= max_attn_len
             )
     if contextual_seq_len > 0:
+        max_ids_3d = max_ids.unsqueeze(1)
         valid_attn_mask = torch.logical_or(
-            valid_attn_mask, torch.logical_and(row_ids == 0, col_ids < max_ids)
+            valid_attn_mask,
+            torch.logical_and(row_ids == 0, col_ids < max_ids_3d),
         )
     return valid_attn_mask
 
@@ -127,6 +131,66 @@ def _pad_qkv(
     return padded_q, padded_k, padded_v
 
 
+def _pad_kv(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    N: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    L, H, D = k.shape
+    V = v.shape[2]
+    padded_k = (
+        torch.ops.fbgemm.jagged_to_padded_dense(
+            values=k.reshape(L, H * D),
+            offsets=[seq_offsets],
+            max_lengths=[N],
+            padding_value=0.0,
+        )
+        .view(-1, N, H, D)
+        .transpose(1, 2)
+    )
+    padded_v = (
+        torch.ops.fbgemm.jagged_to_padded_dense(
+            values=v.reshape(L, H * V),
+            offsets=[seq_offsets],
+            max_lengths=[N],
+            padding_value=0.0,
+        )
+        .view(-1, N, H, V)
+        .transpose(1, 2)
+    )
+    return padded_k, padded_v
+
+
+def _pad_q_chunk(
+    q: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    row_start: int,
+    row_end: int,
+) -> torch.Tensor:
+    B = seq_offsets.numel() - 1
+    chunk_size = row_end - row_start
+    _, H, D = q.shape
+    padded_q_chunk = torch.zeros(
+        (B, H, chunk_size, D),
+        device=q.device,
+        dtype=q.dtype,
+    )
+
+    for batch_idx in range(B):
+        seq_start = int(seq_offsets[batch_idx].item())
+        seq_end = int(seq_offsets[batch_idx + 1].item())
+        seq_len = seq_end - seq_start
+        if row_start >= seq_len:
+            continue
+        local_end = min(row_end, seq_len)
+        valid_rows = local_end - row_start
+        q_slice = q[seq_start + row_start : seq_start + local_end]
+        padded_q_chunk[batch_idx, :, :valid_rows, :] = q_slice.transpose(0, 1)
+
+    return padded_q_chunk
+
+
 @torch.fx.wrap
 def pytorch_hstu_mha(
     max_seq_len: int,
@@ -146,19 +210,7 @@ def pytorch_hstu_mha(
 ) -> torch.Tensor:
     L, H, _ = q.shape
     V = v.shape[2]
-    q, k, v = _pad_qkv(
-        q, k, v, seq_offsets, max_seq_len
-    )  # [B, H, N, D) and [B, H, N, V]
-    valid_attn_mask = _get_valid_attn_mask(
-        device=q.device,
-        causal=causal,
-        N=max_seq_len,
-        seq_lengths=seq_offsets[1:] - seq_offsets[:-1],
-        num_targets=num_targets,
-        max_attn_len=max_attn_len,
-        contextual_seq_len=contextual_seq_len,
-        min_full_attn_seq_len=min_full_attn_seq_len,
-    )
+    seq_lengths = seq_offsets[1:] - seq_offsets[:-1]
 
     prepared_attn_scale = attn_scale
     if prepared_attn_scale is not None and prepared_attn_scale.ndim > 0:
@@ -179,10 +231,23 @@ def pytorch_hstu_mha(
         chunk_size = 256
 
     if chunk_size > 0 and chunk_size < max_seq_len:
+        k, v = _pad_kv(k, v, seq_offsets, max_seq_len)
         chunks = []
         for start in range(0, max_seq_len, chunk_size):
             end = min(start + chunk_size, max_seq_len)
-            q_chunk = q[:, :, start:end, :]
+            valid_attn_mask = _get_valid_attn_mask(
+                device=q.device,
+                causal=causal,
+                N=max_seq_len,
+                seq_lengths=seq_lengths,
+                num_targets=num_targets,
+                max_attn_len=max_attn_len,
+                contextual_seq_len=contextual_seq_len,
+                min_full_attn_seq_len=min_full_attn_seq_len,
+                row_start=start,
+                row_end=end,
+            )
+            q_chunk = _pad_q_chunk(q, seq_offsets, start, end)
             qk_attn_chunk = torch.einsum("bhxa,bhya->bhxy", q_chunk, k) * alpha
             if prepared_attn_scale is not None:
                 qk_attn_chunk = F.silu(qk_attn_chunk) * prepared_attn_scale[
@@ -201,6 +266,19 @@ def pytorch_hstu_mha(
             chunks.append(torch.einsum("bhxy,bhyv->bhxv", qk_attn_chunk, v))
         attn_dense = torch.cat(chunks, dim=2)
     else:
+        q, k, v = _pad_qkv(
+            q, k, v, seq_offsets, max_seq_len
+        )  # [B, H, N, D) and [B, H, N, V]
+        valid_attn_mask = _get_valid_attn_mask(
+            device=q.device,
+            causal=causal,
+            N=max_seq_len,
+            seq_lengths=seq_lengths,
+            num_targets=num_targets,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            min_full_attn_seq_len=min_full_attn_seq_len,
+        )
         qk_attn = torch.einsum("bhxa,bhya->bhxy", q, k) * alpha
         if prepared_attn_scale is not None:
             qk_attn = F.silu(qk_attn) * prepared_attn_scale
