@@ -134,6 +134,10 @@ class DlrmHSTU(HammerModule):
         self._hstu_configs = hstu_configs
         self._bf16_training: bool = bf16_training
         set_static_max_seq_lens([self._hstu_configs.max_seq_len])
+        self._feature_to_num_embeddings: Dict[str, int] = {}
+        for table in embedding_tables.values():
+            for feature_name in table.feature_names:
+                self._feature_to_num_embeddings[feature_name] = table.num_embeddings
 
         embedding_collection_kwargs = {
             "tables": list(embedding_tables.values()),
@@ -281,6 +285,74 @@ class DlrmHSTU(HammerModule):
             LayerNorm(hstu_configs.hstu_transducer_embedding_dim),
         ).apply(init_mlp_weights_optional_bias)
 
+    def _summarize_tensor(self, tensor: torch.Tensor) -> Dict[str, float]:
+        data = tensor.detach()
+        if data.numel() == 0:
+            return {"numel": 0.0, "finite_ratio": 1.0}
+        if not data.is_floating_point():
+            data = data.to(torch.float32)
+        data = data.to(torch.float32)
+        finite = torch.isfinite(data)
+        finite_values = data[finite]
+        summary: Dict[str, float] = {
+            "numel": float(data.numel()),
+            "finite_ratio": float(finite.float().mean().item()),
+        }
+        if finite_values.numel() > 0:
+            summary["min"] = float(finite_values.min().item())
+            summary["max"] = float(finite_values.max().item())
+            summary["mean"] = float(finite_values.mean().item())
+        else:
+            summary["min"] = float("nan")
+            summary["max"] = float("nan")
+            summary["mean"] = float("nan")
+        return summary
+
+    def _has_non_finite(self, tensor: torch.Tensor) -> bool:
+        if tensor.numel() == 0:
+            return False
+        if tensor.is_floating_point() or tensor.is_complex():
+            return not bool(torch.isfinite(tensor).all().item())
+        return False
+
+    def _log_embedding_lookup_diagnostics(
+        self,
+        merged_sparse_features: KeyedJaggedTensor,
+        seq_embeddings_dict: Dict[str, KeyedJaggedTensor],
+    ) -> None:
+        for feature_name in merged_sparse_features.keys():
+            ids = merged_sparse_features[feature_name].values()
+            num_embeddings = self._feature_to_num_embeddings.get(feature_name)
+            if num_embeddings is not None and ids.numel() > 0:
+                out_of_range = torch.logical_or(ids < 0, ids >= num_embeddings)
+                out_of_range_ratio = float(out_of_range.float().mean().item())
+                if out_of_range_ratio > 0.0:
+                    logger.warning(
+                        "Embedding id out-of-range detected for %s: %s",
+                        feature_name,
+                        {
+                            "num_embeddings": float(num_embeddings),
+                            "out_of_range_ratio": out_of_range_ratio,
+                            "ids": self._summarize_tensor(ids),
+                        },
+                    )
+
+        for feature_name, jagged in seq_embeddings_dict.items():
+            emb = jagged.values()
+            if self._has_non_finite(emb):
+                ids = merged_sparse_features[feature_name].values()
+                logger.warning(
+                    "Non-finite embedding lookup output for %s: %s",
+                    feature_name,
+                    {
+                        "embedding": self._summarize_tensor(emb),
+                        "ids": self._summarize_tensor(ids),
+                        "num_embeddings": float(
+                            self._feature_to_num_embeddings.get(feature_name, -1)
+                        ),
+                    },
+                )
+
     def _construct_payload(
         self,
         payload_features: Dict[str, torch.Tensor],
@@ -409,6 +481,10 @@ class DlrmHSTU(HammerModule):
             ),
         )
         seq_embeddings_dict = self._embedding_collection(merged_sparse_features)
+        self._log_embedding_lookup_diagnostics(
+            merged_sparse_features=merged_sparse_features,
+            seq_embeddings_dict=seq_embeddings_dict,
+        )
         num_candidates = fx_mark_length_features(
             candidates_features.lengths().view(len(candidates_features.keys()), -1)
         )[0]
