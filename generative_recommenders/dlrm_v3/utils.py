@@ -21,6 +21,7 @@ import contextlib
 import logging
 import os
 from typing import Callable, Dict, List, Optional
+from unittest import mock
 
 import gin
 import tensorboard  # @manual=//tensorboard:lib  # noqa: F401 - required implicit dep when using torch.utils.tensorboard
@@ -49,6 +50,17 @@ from torchrec.metrics.rec_metric import RecMetricComputation
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("utils")
+
+
+def _get_profiler_activities() -> List[ProfilerActivity]:
+    activities: List[ProfilerActivity] = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+    return activities
+
+
+def _get_profiler_sort_key() -> str:
+    return "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
 
 
 def _binary_roc_auc(
@@ -124,7 +136,7 @@ def _on_trace_ready_fn(
         path = f"manifold://{bucket_name}/{manifold_path}/{file_name}"
         logger.warning(
             p.key_averages(group_by_input_shape=True).table(
-                sort_by="self_cuda_time_total"
+                sort_by=_get_profiler_sort_key()
             )
         )
         logger.warning(
@@ -149,7 +161,7 @@ def profiler_or_nullcontext(enabled: bool, with_stack: bool):
     return (
         profile(
             # pyre-fixme[16]: Module `profiler` has no attribute `ProfilerActivity`.
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            activities=_get_profiler_activities(),
             on_trace_ready=_on_trace_ready_fn(),
             with_stack=with_stack,
         )
@@ -181,7 +193,7 @@ class Profiler:
             ),
             on_trace_ready=_on_trace_ready_fn(self.rank),
             # pyre-fixme[16]: Module `profiler` has no attribute `ProfilerActivity`.
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            activities=_get_profiler_activities(),
             record_shapes=True,
             profile_memory=False,
             with_stack=False,
@@ -325,6 +337,45 @@ class MetricsLogger:
         if self.metric_device.type == "cpu":
             metric.sync_on_compute = False  # pyre-ignore [16]
         return metric
+
+    def _metric_compute_context(self):
+        if self.metric_device.type == "cpu" and torch.distributed.is_initialized():
+            return mock.patch("torch.distributed.is_initialized", return_value=False)
+        return contextlib.nullcontext()
+
+    def _compute_metric_safely(self, metric: RecMetricComputation):
+        try:
+            with self._metric_compute_context():
+                return metric.compute()
+        except RuntimeError as exc:
+            if (
+                self.metric_device.type != "cpu"
+                or "No backend type associated with device type cpu" not in str(exc)
+            ):
+                raise
+
+            logger.warning(
+                "Metric compute hit CPU/backend sync incompatibility; retrying without distributed sync"
+            )
+            old_process_group = getattr(metric, "process_group", None)
+            old_dist_sync_fn = getattr(metric, "dist_sync_fn", None)
+            old_sync_on_compute = getattr(metric, "sync_on_compute", None)
+            try:
+                if hasattr(metric, "process_group"):
+                    metric.process_group = None  # pyre-ignore [16]
+                if hasattr(metric, "dist_sync_fn"):
+                    metric.dist_sync_fn = None  # pyre-ignore [16]
+                if hasattr(metric, "sync_on_compute"):
+                    metric.sync_on_compute = False  # pyre-ignore [16]
+                with mock.patch("torch.distributed.is_initialized", return_value=False):
+                    return metric.compute()
+            finally:
+                if hasattr(metric, "process_group"):
+                    metric.process_group = old_process_group  # pyre-ignore [16]
+                if hasattr(metric, "dist_sync_fn"):
+                    metric.dist_sync_fn = old_dist_sync_fn  # pyre-ignore [16]
+                if hasattr(metric, "sync_on_compute"):
+                    metric.sync_on_compute = old_sync_on_compute  # pyre-ignore [16]
 
     @property
     def all_metrics(self) -> Dict[str, List[RecMetricComputation]]:
@@ -489,7 +540,7 @@ class MetricsLogger:
         all_computed_metrics = {}
 
         for metric in self.all_metrics[mode]:
-            computed_metrics = metric.compute()
+            computed_metrics = self._compute_metric_safely(metric)
             for computed in computed_metrics:
                 all_values = computed.value.cpu()
                 for i, task_name in enumerate(self.task_names):
