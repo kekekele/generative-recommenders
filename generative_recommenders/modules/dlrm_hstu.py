@@ -134,6 +134,11 @@ class DlrmHSTU(HammerModule):
         self._hstu_configs = hstu_configs
         self._bf16_training: bool = bf16_training
         set_static_max_seq_lens([self._hstu_configs.max_seq_len])
+        self._force_cpu_embedding_lookup: bool = (
+            is_dense
+            and embedding_device is not None
+            and embedding_device.type == "npu"
+        )
         self._feature_to_num_embeddings: Dict[str, int] = {}
         for table in embedding_tables.values():
             for feature_name in table.feature_names:
@@ -480,9 +485,18 @@ class DlrmHSTU(HammerModule):
                 dim=0,
             ),
         )
-        seq_embeddings_dict = self._embedding_collection(merged_sparse_features)
+        lookup_features = merged_sparse_features
+        lookup_output_device = merged_sparse_features.values().device
+        if self._force_cpu_embedding_lookup:
+            lookup_features = KeyedJaggedTensor.from_lengths_sync(
+                keys=merged_sparse_features.keys(),
+                values=merged_sparse_features.values().cpu(),
+                lengths=merged_sparse_features.lengths().cpu(),
+            )
+
+        seq_embeddings_dict = self._embedding_collection(lookup_features)
         self._log_embedding_lookup_diagnostics(
-            merged_sparse_features=merged_sparse_features,
+            merged_sparse_features=lookup_features,
             seq_embeddings_dict=seq_embeddings_dict,
         )
         num_candidates = fx_mark_length_features(
@@ -532,8 +546,8 @@ class DlrmHSTU(HammerModule):
 
         seq_embeddings = {
             k: SequenceEmbedding(
-                lengths=seq_embeddings_dict[k].lengths(),
-                embedding=seq_embeddings_dict[k].values(),
+                lengths=seq_embeddings_dict[k].lengths().to(lookup_output_device),
+                embedding=seq_embeddings_dict[k].values().to(lookup_output_device),
             )
             for k in self._hstu_configs.user_embedding_feature_names
             + self._hstu_configs.item_embedding_feature_names
