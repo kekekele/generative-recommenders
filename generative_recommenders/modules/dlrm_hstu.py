@@ -140,9 +140,11 @@ class DlrmHSTU(HammerModule):
             and embedding_device.type == "npu"
         )
         self._feature_to_num_embeddings: Dict[str, int] = {}
+        self._feature_to_table_name: Dict[str, str] = {}
         for table in embedding_tables.values():
             for feature_name in table.feature_names:
                 self._feature_to_num_embeddings[feature_name] = table.num_embeddings
+                self._feature_to_table_name[feature_name] = table.name
 
         embedding_collection_kwargs = {
             "tables": list(embedding_tables.values()),
@@ -323,7 +325,7 @@ class DlrmHSTU(HammerModule):
     def _log_embedding_lookup_diagnostics(
         self,
         merged_sparse_features: KeyedJaggedTensor,
-        seq_embeddings_dict: Dict[str, KeyedJaggedTensor],
+        embeddings_by_feature: Dict[str, torch.Tensor],
     ) -> None:
         for feature_name in merged_sparse_features.keys():
             ids = merged_sparse_features[feature_name].values()
@@ -342,8 +344,7 @@ class DlrmHSTU(HammerModule):
                         },
                     )
 
-        for feature_name, jagged in seq_embeddings_dict.items():
-            emb = jagged.values()
+        for feature_name, emb in embeddings_by_feature.items():
             if self._has_non_finite(emb):
                 ids = merged_sparse_features[feature_name].values()
                 logger.warning(
@@ -493,12 +494,40 @@ class DlrmHSTU(HammerModule):
                 values=merged_sparse_features.values().cpu(),
                 lengths=merged_sparse_features.lengths().cpu(),
             )
-
-        seq_embeddings_dict = self._embedding_collection(lookup_features)
-        self._log_embedding_lookup_diagnostics(
-            merged_sparse_features=lookup_features,
-            seq_embeddings_dict=seq_embeddings_dict,
+        needed_features = (
+            self._hstu_configs.user_embedding_feature_names
+            + self._hstu_configs.item_embedding_feature_names
         )
+        if self._force_cpu_embedding_lookup:
+            embeddings_by_feature: Dict[str, torch.Tensor] = {}
+            lengths_by_feature: Dict[str, torch.Tensor] = {}
+            for feature_name in needed_features:
+                table_name = self._feature_to_table_name[feature_name]
+                ids = lookup_features[feature_name].values().to(torch.long)
+                lengths = lookup_features[feature_name].lengths()
+                weight = self._embedding_collection.embeddings[table_name].weight
+                emb = torch.nn.functional.embedding(ids, weight)
+                embeddings_by_feature[feature_name] = emb
+                lengths_by_feature[feature_name] = lengths
+
+            self._log_embedding_lookup_diagnostics(
+                merged_sparse_features=lookup_features,
+                embeddings_by_feature=embeddings_by_feature,
+            )
+        else:
+            seq_embeddings_dict = self._embedding_collection(lookup_features)
+            embeddings_by_feature = {
+                feature_name: seq_embeddings_dict[feature_name].values()
+                for feature_name in needed_features
+            }
+            lengths_by_feature = {
+                feature_name: seq_embeddings_dict[feature_name].lengths()
+                for feature_name in needed_features
+            }
+            self._log_embedding_lookup_diagnostics(
+                merged_sparse_features=lookup_features,
+                embeddings_by_feature=embeddings_by_feature,
+            )
         num_candidates = fx_mark_length_features(
             candidates_features.lengths().view(len(candidates_features.keys()), -1)
         )[0]
@@ -546,11 +575,10 @@ class DlrmHSTU(HammerModule):
 
         seq_embeddings = {
             k: SequenceEmbedding(
-                lengths=seq_embeddings_dict[k].lengths().to(lookup_output_device),
-                embedding=seq_embeddings_dict[k].values().to(lookup_output_device),
+                lengths=lengths_by_feature[k].to(lookup_output_device),
+                embedding=embeddings_by_feature[k].to(lookup_output_device),
             )
-            for k in self._hstu_configs.user_embedding_feature_names
-            + self._hstu_configs.item_embedding_feature_names
+            for k in needed_features
         }
 
         return (
