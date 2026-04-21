@@ -222,6 +222,9 @@ class MetricsLogger:
         enable_auc: bool = True,
     ) -> None:
         self.multitask_configs: List[TaskConfig] = multitask_configs
+        self.metric_device: torch.device = (
+            torch.device("cpu") if device.type == "npu" else device
+        )
         all_classification_tasks: List[str] = [
             task.task_name
             for task in self.multitask_configs
@@ -256,7 +259,7 @@ class MetricsLogger:
                         batch_size=batch_size,
                         n_tasks=len(all_classification_tasks),
                         window_size=window_size,
-                    ).to(device)
+                    ).to(self.metric_device)
                 )
                 self.class_metrics[mode].append(
                     AccuracyMetricComputation(
@@ -264,7 +267,7 @@ class MetricsLogger:
                         batch_size=batch_size,
                         n_tasks=len(all_classification_tasks),
                         window_size=window_size,
-                    ).to(device)
+                    ).to(self.metric_device)
                 )
                 self.class_metrics[mode].append(
                     GAUCMetricComputation(
@@ -272,7 +275,7 @@ class MetricsLogger:
                         batch_size=batch_size,
                         n_tasks=len(all_classification_tasks),
                         window_size=window_size,
-                    ).to(device)
+                    ).to(self.metric_device)
                 )
 
         self.regression_metrics: Dict[str, List[RecMetricComputation]] = {
@@ -287,7 +290,7 @@ class MetricsLogger:
                         batch_size=batch_size,
                         n_tasks=len(all_regression_tasks),
                         window_size=window_size,
-                    ).to(device)
+                    ).to(self.metric_device)
                 )
                 self.regression_metrics[mode].append(
                     MAEMetricComputation(
@@ -295,7 +298,7 @@ class MetricsLogger:
                         batch_size=batch_size,
                         n_tasks=len(all_regression_tasks),
                         window_size=window_size,
-                    ).to(device)
+                    ).to(self.metric_device)
                 )
 
         self.global_step: Dict[str, int] = {"train": 0, "eval": 0}
@@ -335,19 +338,24 @@ class MetricsLogger:
             num_candidates: Number of candidates per sample (for GAUC).
             mode: Either 'train' or 'eval'.
         """
+        metric_predictions = predictions.detach().to(self.metric_device)
+        metric_labels = labels.detach().to(self.metric_device)
+        metric_weights = weights.detach().to(self.metric_device)
+        metric_num_candidates = num_candidates.detach().to(self.metric_device)
+
         for metric in self.all_metrics[mode]:
             if isinstance(metric, GAUCMetricComputation):
                 metric.update(
-                    predictions=predictions,
-                    labels=labels,
-                    weights=weights,
-                    num_candidates=num_candidates,
+                    predictions=metric_predictions,
+                    labels=metric_labels,
+                    weights=metric_weights,
+                    num_candidates=metric_num_candidates,
                 )
             else:
                 metric.update(
-                    predictions=predictions,
-                    labels=labels,
-                    weights=weights,
+                    predictions=metric_predictions,
+                    labels=metric_labels,
+                    weights=metric_weights,
                 )
 
         if self.enable_auc:
