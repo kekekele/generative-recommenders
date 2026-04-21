@@ -171,6 +171,15 @@ def _inspect_embedding_collection_params(
         logger.info(f"{stage} embedding parameters are finite")
 
 
+def _pin_embedding_collection_to_cpu_if_needed(model: torch.nn.Module) -> None:
+    if not bool(getattr(model, "_force_cpu_embedding_lookup", False)):
+        return
+    if not hasattr(model, "_embedding_collection"):
+        return
+    model._embedding_collection = model._embedding_collection.to(torch.device("cpu"))  # pyre-ignore [16]
+    logger.info("Pinned embedding collection to CPU for NPU lookup fallback")
+
+
 def _validate_gradient_accumulation(
     gradient_accumulation_steps: int,
     strict_semantics: bool,
@@ -399,6 +408,7 @@ def make_optimizer_and_shard(
             stage="before_dense_model_to_device",
         )
         model = model.to(device)
+        _pin_embedding_collection_to_cpu_if_needed(model)
         _inspect_embedding_collection_params(
             model=model,
             stage="after_dense_model_to_device",
