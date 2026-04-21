@@ -258,28 +258,34 @@ class MetricsLogger:
         if all_classification_tasks:
             for mode in ["train", "eval"]:
                 self.class_metrics[mode].append(
-                    NEMetricComputation(
-                        my_rank=rank,
-                        batch_size=batch_size,
-                        n_tasks=len(all_classification_tasks),
-                        window_size=window_size,
-                    ).to(self.metric_device)
+                    self._configure_metric(
+                        NEMetricComputation(
+                            my_rank=rank,
+                            batch_size=batch_size,
+                            n_tasks=len(all_classification_tasks),
+                            window_size=window_size,
+                        ).to(self.metric_device)
+                    )
                 )
                 self.class_metrics[mode].append(
-                    AccuracyMetricComputation(
-                        my_rank=rank,
-                        batch_size=batch_size,
-                        n_tasks=len(all_classification_tasks),
-                        window_size=window_size,
-                    ).to(self.metric_device)
+                    self._configure_metric(
+                        AccuracyMetricComputation(
+                            my_rank=rank,
+                            batch_size=batch_size,
+                            n_tasks=len(all_classification_tasks),
+                            window_size=window_size,
+                        ).to(self.metric_device)
+                    )
                 )
                 self.class_metrics[mode].append(
-                    GAUCMetricComputation(
-                        my_rank=rank,
-                        batch_size=batch_size,
-                        n_tasks=len(all_classification_tasks),
-                        window_size=window_size,
-                    ).to(self.metric_device)
+                    self._configure_metric(
+                        GAUCMetricComputation(
+                            my_rank=rank,
+                            batch_size=batch_size,
+                            n_tasks=len(all_classification_tasks),
+                            window_size=window_size,
+                        ).to(self.metric_device)
+                    )
                 )
 
         self.regression_metrics: Dict[str, List[RecMetricComputation]] = {
@@ -289,20 +295,24 @@ class MetricsLogger:
         if all_regression_tasks:
             for mode in ["train", "eval"]:
                 self.regression_metrics[mode].append(
-                    MSEMetricComputation(
-                        my_rank=rank,
-                        batch_size=batch_size,
-                        n_tasks=len(all_regression_tasks),
-                        window_size=window_size,
-                    ).to(self.metric_device)
+                    self._configure_metric(
+                        MSEMetricComputation(
+                            my_rank=rank,
+                            batch_size=batch_size,
+                            n_tasks=len(all_regression_tasks),
+                            window_size=window_size,
+                        ).to(self.metric_device)
+                    )
                 )
                 self.regression_metrics[mode].append(
-                    MAEMetricComputation(
-                        my_rank=rank,
-                        batch_size=batch_size,
-                        n_tasks=len(all_regression_tasks),
-                        window_size=window_size,
-                    ).to(self.metric_device)
+                    self._configure_metric(
+                        MAEMetricComputation(
+                            my_rank=rank,
+                            batch_size=batch_size,
+                            n_tasks=len(all_regression_tasks),
+                            window_size=window_size,
+                        ).to(self.metric_device)
+                    )
                 )
 
         self.global_step: Dict[str, int] = {"train": 0, "eval": 0}
@@ -310,6 +320,11 @@ class MetricsLogger:
         if tensorboard_log_path != "":
             self.tb_logger = SummaryWriter(log_dir=tensorboard_log_path, purge_step=0)
             self.tb_logger.flush()
+
+    def _configure_metric(self, metric: RecMetricComputation) -> RecMetricComputation:
+        if self.metric_device.type == "cpu":
+            metric.sync_on_compute = False  # pyre-ignore [16]
+        return metric
 
     @property
     def all_metrics(self) -> Dict[str, List[RecMetricComputation]]:
