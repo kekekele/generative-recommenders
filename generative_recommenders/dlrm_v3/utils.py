@@ -246,6 +246,10 @@ class MetricsLogger:
             "train": {"predictions": [], "labels": [], "weights": []},
             "eval": {"predictions": [], "labels": [], "weights": []},
         }
+        self._last_batch_diagnostics: Dict[str, Dict[str, float]] = {
+            "train": {},
+            "eval": {},
+        }
 
         self.class_metrics: Dict[str, List[RecMetricComputation]] = {
             "train": [],
@@ -368,7 +372,70 @@ class MetricsLogger:
             self._auc_buffer[mode]["weights"].append(cls_weights)
             self._trim_auc_buffer(mode)
 
+        self._update_batch_diagnostics(
+            predictions=predictions,
+            labels=labels,
+            weights=weights,
+            mode=mode,
+        )
+
         self.global_step[mode] += 1
+
+    def _update_batch_diagnostics(
+        self,
+        predictions: torch.Tensor,
+        labels: torch.Tensor,
+        weights: torch.Tensor,
+        mode: str,
+    ) -> None:
+        n_cls = len(self.classification_task_names)
+        if n_cls == 0:
+            return
+
+        preds = predictions[:, :n_cls].detach().to(torch.float32).cpu()
+        lbls = labels[:, :n_cls].detach().to(torch.float32).cpu()
+        wts = weights[:, :n_cls].detach().to(torch.float32).cpu()
+
+        pred_finite = torch.isfinite(preds)
+        label_finite = torch.isfinite(lbls)
+        weight_finite = torch.isfinite(wts)
+
+        self._last_batch_diagnostics[mode] = {
+            "pred_min": float(preds.min().item()) if preds.numel() > 0 else float("nan"),
+            "pred_max": float(preds.max().item()) if preds.numel() > 0 else float("nan"),
+            "pred_mean": float(preds.mean().item()) if preds.numel() > 0 else float("nan"),
+            "label_mean": float(lbls.mean().item()) if lbls.numel() > 0 else float("nan"),
+            "weight_sum": float(wts.sum().item()) if wts.numel() > 0 else float("nan"),
+            "pred_finite_ratio": float(pred_finite.float().mean().item())
+            if pred_finite.numel() > 0
+            else 0.0,
+            "label_finite_ratio": float(label_finite.float().mean().item())
+            if label_finite.numel() > 0
+            else 0.0,
+            "weight_finite_ratio": float(weight_finite.float().mean().item())
+            if weight_finite.numel() > 0
+            else 0.0,
+        }
+
+        if (
+            self._last_batch_diagnostics[mode]["pred_finite_ratio"] < 1.0
+            or self._last_batch_diagnostics[mode]["label_finite_ratio"] < 1.0
+            or self._last_batch_diagnostics[mode]["weight_finite_ratio"] < 1.0
+        ):
+            logger.warning(
+                f"{mode} - Step {self.global_step[mode] + 1} detected non-finite metric inputs: "
+                f"{self._last_batch_diagnostics[mode]}"
+            )
+
+    @staticmethod
+    def _is_finite_scalar(value: object) -> bool:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return False
+            return bool(torch.isfinite(value).all().item())
+        if isinstance(value, float):
+            return torch.isfinite(torch.tensor(value)).item()
+        return True
 
     def _trim_auc_buffer(self, mode: str) -> None:
         while self._auc_buffer[mode]["predictions"]:
@@ -415,6 +482,18 @@ class MetricsLogger:
                     all_computed_metrics[key] = all_values[i]
 
         all_computed_metrics.update(self._compute_auc_metrics(mode=mode))
+
+        non_finite_ne_keys = [
+            key
+            for key, value in all_computed_metrics.items()
+            if "/ne/" in key and not self._is_finite_scalar(value)
+        ]
+        if non_finite_ne_keys:
+            logger.warning(
+                f"{mode} - Step {self.global_step[mode]} NE is non-finite for keys "
+                f"{non_finite_ne_keys}. Last batch diagnostics: "
+                f"{self._last_batch_diagnostics[mode]}"
+            )
 
         logger.info(
             f"{mode} - Step {self.global_step[mode]} metrics: {all_computed_metrics}"
@@ -468,6 +547,7 @@ class MetricsLogger:
         for metric in self.all_metrics[mode]:
             metric.reset()
         self._auc_buffer[mode] = {"predictions": [], "labels": [], "weights": []}
+        self._last_batch_diagnostics[mode] = {}
 
 
 # the datasets we support
