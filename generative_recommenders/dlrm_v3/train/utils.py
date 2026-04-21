@@ -69,6 +69,89 @@ TORCHREC_TYPES: Set[Type[Union[EmbeddingBagCollection, EmbeddingCollection]]] = 
 }
 
 
+def _summarize_tensor(tensor: Optional[torch.Tensor]) -> Dict[str, float]:
+    if tensor is None:
+        return {"present": 0.0}
+    data = tensor.detach()
+    if data.numel() == 0:
+        return {"present": 1.0, "numel": 0.0}
+    if not data.is_floating_point():
+        data = data.to(torch.float32)
+    data = data.to(torch.float32).cpu()
+    finite = torch.isfinite(data)
+    finite_values = data[finite]
+    summary: Dict[str, float] = {
+        "present": 1.0,
+        "numel": float(data.numel()),
+        "finite_ratio": float(finite.float().mean().item()),
+    }
+    if finite_values.numel() > 0:
+        summary["min"] = float(finite_values.min().item())
+        summary["max"] = float(finite_values.max().item())
+        summary["mean"] = float(finite_values.mean().item())
+    else:
+        summary["min"] = float("nan")
+        summary["max"] = float("nan")
+        summary["mean"] = float("nan")
+    return summary
+
+
+def _has_non_finite_tensor(tensor: Optional[torch.Tensor]) -> bool:
+    if tensor is None:
+        return False
+    if tensor.numel() == 0:
+        return False
+    if tensor.is_floating_point() or tensor.is_complex():
+        return not bool(torch.isfinite(tensor.detach()).all().item())
+    return False
+
+
+def _get_first_non_finite_param_or_grad(
+    model: torch.nn.Module,
+) -> Optional[Tuple[str, str, Dict[str, float]]]:
+    for name, param in model.named_parameters():
+        if _has_non_finite_tensor(param):
+            return name, "param", _summarize_tensor(param)
+        if param.grad is not None and _has_non_finite_tensor(param.grad):
+            return name, "grad", _summarize_tensor(param.grad)
+    return None
+
+
+def _log_non_finite_training_state(
+    *,
+    loop_name: str,
+    batch_idx: int,
+    user_embeddings: Optional[torch.Tensor],
+    item_embeddings: Optional[torch.Tensor],
+    predictions: Optional[torch.Tensor],
+    labels: Optional[torch.Tensor],
+    weights: Optional[torch.Tensor],
+    loss: Optional[torch.Tensor],
+    aux_losses: Dict[str, torch.Tensor],
+    model: torch.nn.Module,
+) -> None:
+    first_bad = _get_first_non_finite_param_or_grad(model)
+    aux_loss_summary = {
+        key: _summarize_tensor(value) for key, value in aux_losses.items()
+    }
+    message = {
+        "user_embeddings": _summarize_tensor(user_embeddings),
+        "item_embeddings": _summarize_tensor(item_embeddings),
+        "predictions": _summarize_tensor(predictions),
+        "labels": _summarize_tensor(labels),
+        "weights": _summarize_tensor(weights),
+        "loss": _summarize_tensor(loss),
+        "aux_losses": aux_loss_summary,
+    }
+    if first_bad is not None:
+        message["first_non_finite_parameter"] = {
+            "name": first_bad[0],
+            "kind": first_bad[1],
+            "stats": first_bad[2],
+        }
+    logger.warning(f"{loop_name} - Batch {batch_idx} non-finite state: {message}")
+
+
 def _validate_gradient_accumulation(
     gradient_accumulation_steps: int,
     strict_semantics: bool,
@@ -515,8 +598,8 @@ def train_loop(
         for sample in dataloader:
             sample.to(device)
             (
-                _,
-                _,
+                user_embeddings,
+                item_embeddings,
                 aux_losses,
                 mt_target_preds,
                 mt_target_labels,
@@ -526,7 +609,39 @@ def train_loop(
                 sample.candidates_features_kjt,
             )
             loss = sum(aux_losses.values())
+            if (
+                _has_non_finite_tensor(user_embeddings)
+                or _has_non_finite_tensor(item_embeddings)
+                or _has_non_finite_tensor(mt_target_preds)
+                or _has_non_finite_tensor(loss)
+            ):
+                _log_non_finite_training_state(
+                    loop_name="train",
+                    batch_idx=batch_idx,
+                    user_embeddings=user_embeddings,
+                    item_embeddings=item_embeddings,
+                    predictions=mt_target_preds,
+                    labels=mt_target_labels,
+                    weights=mt_target_weights,
+                    loss=loss,
+                    aux_losses=aux_losses,
+                    model=model,
+                )
             (loss / gradient_accumulation_steps).backward()
+            first_bad = _get_first_non_finite_param_or_grad(model)
+            if first_bad is not None:
+                _log_non_finite_training_state(
+                    loop_name="train-post-backward",
+                    batch_idx=batch_idx,
+                    user_embeddings=user_embeddings,
+                    item_embeddings=item_embeddings,
+                    predictions=mt_target_preds,
+                    labels=mt_target_labels,
+                    weights=mt_target_weights,
+                    loss=loss,
+                    aux_losses=aux_losses,
+                    model=model,
+                )
             accumulation_step += 1
             should_step = accumulation_step == gradient_accumulation_steps
             if should_step:
@@ -670,8 +785,8 @@ def train_eval_loop(
                 break
             sample.to(device)
             (
-                _,
-                _,
+                user_embeddings,
+                item_embeddings,
                 aux_losses,
                 mt_target_preds,
                 mt_target_labels,
@@ -681,7 +796,39 @@ def train_eval_loop(
                 sample.candidates_features_kjt,
             )
             loss = sum(aux_losses.values())
+            if (
+                _has_non_finite_tensor(user_embeddings)
+                or _has_non_finite_tensor(item_embeddings)
+                or _has_non_finite_tensor(mt_target_preds)
+                or _has_non_finite_tensor(loss)
+            ):
+                _log_non_finite_training_state(
+                    loop_name="train_eval_train",
+                    batch_idx=train_batch_idx,
+                    user_embeddings=user_embeddings,
+                    item_embeddings=item_embeddings,
+                    predictions=mt_target_preds,
+                    labels=mt_target_labels,
+                    weights=mt_target_weights,
+                    loss=loss,
+                    aux_losses=aux_losses,
+                    model=model,
+                )
             (loss / gradient_accumulation_steps).backward()
+            first_bad = _get_first_non_finite_param_or_grad(model)
+            if first_bad is not None:
+                _log_non_finite_training_state(
+                    loop_name="train_eval_train_post_backward",
+                    batch_idx=train_batch_idx,
+                    user_embeddings=user_embeddings,
+                    item_embeddings=item_embeddings,
+                    predictions=mt_target_preds,
+                    labels=mt_target_labels,
+                    weights=mt_target_weights,
+                    loss=loss,
+                    aux_losses=aux_losses,
+                    model=model,
+                )
             accumulation_step += 1
             should_step = accumulation_step == gradient_accumulation_steps
             if should_step:
@@ -810,8 +957,8 @@ def streaming_train_eval_loop(
                 break
             sample.to(device)
             (
-                _,
-                _,
+                user_embeddings,
+                item_embeddings,
                 aux_losses,
                 mt_target_preds,
                 mt_target_labels,
@@ -821,7 +968,39 @@ def streaming_train_eval_loop(
                 sample.candidates_features_kjt,
             )
             loss = sum(aux_losses.values())
+            if (
+                _has_non_finite_tensor(user_embeddings)
+                or _has_non_finite_tensor(item_embeddings)
+                or _has_non_finite_tensor(mt_target_preds)
+                or _has_non_finite_tensor(loss)
+            ):
+                _log_non_finite_training_state(
+                    loop_name="streaming_train",
+                    batch_idx=train_batch_idx,
+                    user_embeddings=user_embeddings,
+                    item_embeddings=item_embeddings,
+                    predictions=mt_target_preds,
+                    labels=mt_target_labels,
+                    weights=mt_target_weights,
+                    loss=loss,
+                    aux_losses=aux_losses,
+                    model=model,
+                )
             (loss / gradient_accumulation_steps).backward()
+            first_bad = _get_first_non_finite_param_or_grad(model)
+            if first_bad is not None:
+                _log_non_finite_training_state(
+                    loop_name="streaming_train_post_backward",
+                    batch_idx=train_batch_idx,
+                    user_embeddings=user_embeddings,
+                    item_embeddings=item_embeddings,
+                    predictions=mt_target_preds,
+                    labels=mt_target_labels,
+                    weights=mt_target_weights,
+                    loss=loss,
+                    aux_losses=aux_losses,
+                    model=model,
+                )
             accumulation_step += 1
             should_step = accumulation_step == gradient_accumulation_steps
             if should_step:
