@@ -152,6 +152,25 @@ def _log_non_finite_training_state(
     logger.warning(f"{loop_name} - Batch {batch_idx} non-finite state: {message}")
 
 
+def _inspect_embedding_collection_params(
+    model: torch.nn.Module,
+    stage: str,
+) -> None:
+    inspected = False
+    for name, param in model.named_parameters():
+        if "embedding_collection" not in name:
+            continue
+        inspected = True
+        summary = _summarize_tensor(param)
+        if summary.get("finite_ratio", 1.0) < 1.0:
+            logger.warning(
+                f"{stage} detected non-finite embedding parameter {name}: {summary}"
+            )
+            return
+    if inspected:
+        logger.info(f"{stage} embedding parameters are finite")
+
+
 def _validate_gradient_accumulation(
     gradient_accumulation_steps: int,
     strict_semantics: bool,
@@ -375,7 +394,15 @@ def make_optimizer_and_shard(
     )
 
     if not use_model_parallel:
+        _inspect_embedding_collection_params(
+            model=model,
+            stage="before_dense_model_to_device",
+        )
         model = model.to(device)
+        _inspect_embedding_collection_params(
+            model=model,
+            stage="after_dense_model_to_device",
+        )
         del sparse_opt_cls, sparse_opt_args
 
         sparse_params: Dict[str, torch.Tensor] = {}
