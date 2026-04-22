@@ -921,7 +921,7 @@ class LocalNegativesSampler(NegativesSampler):
 
 ## FourierGeo Three Variants (Visualization)
 
-下面汇总当前已落地并训练验证过的 `FourierGeo` 融合方案（含 New-A / New-B）。
+下面汇总当前已落地并训练验证过的 `FourierGeo` 融合方案（含 New-A / New-B / budget-concat-residual）。
 
 公共主干（所有方案共用）：
 
@@ -968,6 +968,17 @@ New-B: New-A + item residual anchor（当前最优）
 - 输出改为: item_emb + scale * fused_emb
 - 当前对照实验中，`geo_fourier_concat_b` 在峰值指标上优于 New-A 和 budget-concat-residual
 
+Budget-Concat-Residual: 预算维度 cat + residual（对照线）
+
+- item 分支: MLP(item_emb) -> item_branch_dim
+- geo 分支: MLP(geo_fourier) -> geo_branch_dim
+- visit 分支: MLP(visit_time) -> visit_time_branch_dim
+- 约束: item_branch_dim + geo_branch_dim + visit_time_branch_dim = D
+- cat 三分支后直接对齐到 D（可加 LayerNorm）
+- 输出: item_emb + scale * budget_fused_emb
+- 典型配置示例（D=50）: 22/16/12 或 24/10/16
+- 现阶段实验结论: 在当前数据上未超过 `geo_fourier_concat_b`，且部分配置未超过纯 item baseline
+
 ### Variant Summary
 
 | Variant | Fusion form | Strength | Risk |
@@ -977,6 +988,7 @@ New-B: New-A + item residual anchor（当前最优）
 | V3 | `Linear -> gate -> add` | 自适应强 | 需监控 gate 漂移 |
 | New-A | `MLP(3-branch) -> cat -> fusion` | 交互表达更强 | 无锚点，后程易过拟合 |
 | New-B | `New-A + residual anchor` | 表达与稳定性平衡最好 | 仍需控制融合强度 |
+| Budget-Concat-Residual | `MLP(3-branch)->budget cat->residual add` | 参数更可控，分支职责清晰 | 预算过强时易形成信息瓶颈 |
 
 ### Current Recommendation
 
