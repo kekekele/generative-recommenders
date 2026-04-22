@@ -1,0 +1,389 @@
+
+
+===== PAGE 1 =====
+OnePiece: The Great Route to Generative Recommendation
+—A Case Study from Tencent Algorithm Competition
+Jiangxia Cao, Shuo Yang, Zijun Wang, Qinghai Tan
+OnePiece Team, NJUST
+jiangxiacao@gmail.com
+Abstract
+In past years, the OpenAI’s Scaling-Laws shows the amazing intelli-
+gence with the next-token prediction paradigm in neural language
+modeling, which pointing out a free-lunch way to enhance the
+model performance by scaling the model parameters. In RecSys,
+the retrieval stage is also follows a ’next-token prediction’ par-
+adigm, to recall the hunderds of items from the global item set,
+thus the generative recommendation usually refers specifically to
+the retrieval stage (without Tree-based methods). This raises a
+philosophical question: without a ground-truth next item, does
+the generative recommendation also holds a potential scaling law?
+In retrospect, the generative recommendation has two different
+technique paradigms: (1) ANN-based framework, utilizing the com-
+pressed user embedding to retrieve nearest other items in embed-
+ding space, e.g, Kuaiformer. (2) Auto-regressive-based framework,
+employing the beam search to decode the item from whole space, e.g,
+OneRec. In this paper, we devise a unified encoder-decoder frame-
+work to validate their scaling-laws at same time. Our empirical
+finding is that both of their losses strictly adhere to power-law Scal-
+ing Laws (𝑅2>0.9) within our unified architecture. Experiments on
+TencentGR-100M/10M demonstrate the superiority of our method,
+and we ranked 10th in the preliminary round, 9th in the semi-finals,
+and 13th in the finals among thousands of scale teams 1.
+1 Introduction
+Background.Scaling Laws [ 1] have emerged as a core driver of
+breakthroughs in domains such as Natural Language Processing
+(NLP) and Computer Vision (CV). However, conventional recom-
+mender system paradigms, particularly those based on discrimi-
+native models, have struggled to replicate similar success. A typ-
+ical observation is that despite substantial efforts from both in-
+dustry and academia to devise increasingly sophisticated architec-
+tures—evolving from early models like DIN [ 10] to MIMN [6] and
+SIM [7]—the performance enhancements exhibit a clear trend of
+diminishing returns. This phenomenon of performance saturation
+strongly suggests that merely increasing the complexity of discrimi-
+native models may be approaching a fundamental paradigm ceiling.
+In stark contrast to the dilemma faced by discriminative models,
+generative models, epitomized by Large Language Models (LLMs),
+have demonstrated remarkable scalability. It shifts the research
+focus from the traditional discriminative task of "predicting click-
+through rates" to exploring the generative task of "next interactive
+item"[4].
+Related work.Recommender systems have long been domi-
+nated by discriminative models. Over the past decade, this paradigm
+has dominated the landscape, evolving from early Matrix Factor-
+ization to deep architectures like DeepFM [3], and subsequently to
+1Our codes:https://github.com/shuoyang2/OnePiece
+Figure 1: The InfoNCE/Semantic ID prediction Scaling Laws
+we tested in TencentGR-100M dataset, first epoch.
+attention-based models such as DIN [ 10] and SIM [7] for model-
+ing user behavior sequences. Inspired by the remarkable scaling
+effects of LLMs in NLP, pioneering works like Kuaiformer [5] unify
+the Transformer as a backbone for industrial-scale multi-interests
+retrieval. Subsequent approaches, such as OneRec [2], further refor-
+mulate recommendation as an auto-regressive generation process,
+validating continuous performance growth with larger parameter
+scales. These advancements suggest that generative architectures
+adhering to Scaling Laws are poised to become the core paradigm
+for next-generation recommender systems.
+Motivation.While generative recommendation (e.g., OneRec [2])
+has successfully adopted Scaling Laws to capture open-ended user
+interests, it relies on beam search to decode the next group of
+items. However, for the heavy inference cost, the topk in the middle
+stage has considerable limitations, and the logp path probability
+will be affected by highly popular items. In contrast, widely-used
+embedding-based retrieval offers efficient and precise logQ debi-
+ased similar scores but struggles to explore an item’s potential in
+the total space within a single query head. Therefore, we consider
+connecting them in a unified framework: first, utilizing the beam-
+search technique to identify the item group from the whole space
+and then scoring them unbiased by the embedding-based technique,
+for a broad and precise retrieval within a limited quota.
+Our Work.To this end, we propose a unified encoder-decoder
+framework to connect them, while (1) the encoder has the SID1 and
+InforNCE losses; (2) the decoder has the SID2 loss under the SID1
+condition. Our design is grounded in a critical empirical observation
+(as illustrated in Figure 1): within a unified backbone, the InfoNCE
+objective exhibits robust scaling behavior highly consistent with
+the generative objective (SID Loss), with both strictly adhering
+to power-law distributions (𝑅2 > 0.9). Guided by this insight, we
+optimize both tasks within a sharedHSTU+MoE backbonevia a
+coarse-to-fine strategy:
+(1) Stage 1: SID-Based Generative Retrieval.We use the back-
+bone’s generative capacity to rapid prune the search space via
+beam search (retrieving Top- 𝐾 SIDs). This step exploits the
+arXiv:2512.07424v1  [cs.IR]  8 Dec 2025
+
+===== PAGE 2 =====
+Conference’17, July 2017, Washington, DC, USA Jiangxia Cao, Shuo Yang, Zijun Wang, Qinghai Tan
+scaling laws of generative loss (SID1/SID2) to capture broad
+semantic structures.
+(2) Stage 2: Embedding-Based Scoring.We utilize thesame
+backboneto output the user’s embedding for precise dot-
+product scoring with LogQ debiasing technique. Driven by our
+observation that embedding representation quality scales pre-
+dictably with model size (InfoNCE scaling), this step effectively
+corrects generative hallucinations and ensures high-precision
+scoring as the model expands.
+Contributions.The main contributions of our work are:
+• Unified Scaling Paradigm:We establish a unified architec-
+ture where semantic generation and embedding retrieval share a
+single scalable backbone, allowing both tasks to benefit simulta-
+neously from Scaling Laws.
+• Collaborative Tokenizer:By fusing multi-modal and structural
+features, we design a residual quantization scheme that signifi-
+cantly reduces hash collisions (7.86% for Top-50 items), providing
+high-resolution targets for the generative model.
+• Efficient Cascade Inference:The proposed cascade inference
+mechanism combines generative Retrieval with embedding re-
+finement, addressing the ranking imprecision of pure generative
+models while maintaining efficient system response latency.
+2 Preliminary
+2.1 Problem Statement
+Our task is to predict the next item 𝑖𝑡+1 a user 𝑢∈U is most likely
+to interact with, given their historical interaction sequence 𝑆𝑢 =
+(𝑖1, 𝑖2, . . . , 𝑖𝑡 ), where 𝑖∈I is an item from the full corpus. To enable
+scalable generative recommendation, we first define a semantic
+tokenizer T that maps each item 𝑖 to a set of hierarchical semantic
+codes (SIDs),c 𝑖 =(𝑐 1
+𝑖 , 𝑐2
+𝑖 ). Our cascade framework decomposes this
+problem into two sub-tasks:
+• SID-Based Generative Retrieval:Given 𝑆𝑢, generate a high-
+quality candidate set of Top-𝐾SIDs.
+• Embedding-Based Scoring:Given 𝑆𝑢, compress its interests
+embeddingh 𝑡+1 , and use this embedding to perform precise scor-
+ing on the SID-retrieved candidate set.
+2.2 MLLM Embedding Analysis
+Table 1: MLLM Embedding Coverage Statistics.
+Member Covered Items Total Items Coverage Rate
+81 16,693,655
+19,099,627
+87.403%
+82 16,732,879 87.600%
+83 16,733,606 87.612%
+85 7,534,474 39.448%
+86 7,161,580 37.495%
+The raw multi-modal embeddings for item tokenization exhibit
+severe coverage inconsistencies. As shown in Table 1, some modali-
+ties (e.g., 82, 85) cover less than 40% of the item corpus. This sparsity
+renders any single modality unreliable for tokenization, as it would
+cause massiveout-of-vocabulary (OOV)issues. Addressing this
+Figure 2: The training workflow of OnePiece.
+data sparsity via a robust fusion strategy is therefore a critical
+prerequisite for building our generative model.
+3 Methodology
+The architecture of our framework (Figure 2) consists of three inte-
+gral components: aSemantic Tokenizerfor item discretization, a
+scalableHSTU+MoE Sequence Encoder-Decoder, and aHybrid
+Objectivemechanism.
+3.1 Semantic Tokenizer
+We employResidual K-meansto quantize item 𝑖 intoc 𝑖 =(𝑐 1
+𝑖 , 𝑐2
+𝑖 )
+with codebooks of size16 , 384. Since single-modality embeddings
+suffer from limited coverage (leading to high collisions), we pro-
+pose aCollaborativestrategy 2 to fuse multi-modal signals. This
+dense representation enables ourGreedy Re-assignmentmecha-
+nism (searchingTop-50neighbors) to effectively resolve conflicts,
+achieving the highest resolution (17.6M unique pairs) and a minimal
+conflict rate of7.86%, as detailed in Table 2.
+3.2 Feature Engineer with ItemDNN
+TheItemDNNmodule fuses multifaceted item features (static info,
+time info, hot info) via an MLP. As shown in Figure 2, we use a
+dual-path (ReLU and identity) design to preserve both non-linear
+ability for the Transformer input and identity-mapping raw feature
+signals for the faiss index building, to ensure the [-1, 1] cosine
+similarity space is fully used.
+3.3 Sequence Encoder
+3.3.1 HSTU Backbone.We adoptHSTU[ 9] as the backbone, which,
+unlike standard 𝑂(𝐿 2) Transformers, achieves near-linear scaling
+to efficiently process long user sequences.
+3.3.2 Sparse Mixture-of-Experts (MoE).To efficiently scale capac-
+ity, we also implement theSparse MoElayers for a large parameters
+tuning with limited training resource (e.g., 7-card H20(96GB)). The
+2Utilizing an InfoNCE-only model to produce Item embedding.
+
+===== PAGE 3 =====
+OnePiece Conference’17, July 2017, Washington, DC, USA
+Table 2: Collision Analysis of Semantic Tokenizer. We compare single-modality embeddings against our Collaborative strategy,
+which is designed to resolve the low coverage and sparsity issues in individual modalities. ’Standard’ denotes direct quantization,
+while ’Re-assigned’ demonstrates the significant conflict reduction achieved by our Greedy Re-assignment strategy.
+Modality
+Training Loss Standard Quantization w/ Greedy Re-assignment
+Loss1 Loss2 Conflicts Conflict Rate Unique Pairs Conflicts Conflict Rate Unique Pairs
+81 0.0184 0.0085 12.6M 75.88% 4.02M 2.15M 12.88% 14.54M
+82 0.2722 0.2220 13.7M 81.95% 3.02M 1.37M 8.19% 15.36M
+83 0.1653 0.1291 14.9M 89.43% 1.76M 7.11M 42.51% 9.61M
+85 0.1545 0.1177 5.45M 72.34% 2.08M 0.49M 6.51% 7.04M
+86 0.1608 0.1262 5.36M 74.98% 1.79M 0.59M 8.34% 6.56M
+Collaborative0.4179 0.2968 14.4M 75.46% 2.27M 1.49M7.86% 17.60M
+layer dynamically routes inputxto the top-𝑘experts:
+MoE(x)=
+𝑁∑︁
+𝑗=1
+𝑔𝑗 (x)𝐸 𝑗 (x),(1)
+where𝑔(·)is the gating function.
+Load Balancing.To prevent expert collapse, we monitor the
+Gini coefficient of expert usage. As shown in Figure 3, the rapid
+descent to a low stable range (0.1–0.4) across all layers confirms
+effectiveload balancing, fully leveraging the expanded capacity.
+Figure 3: Gini coefficient over training steps for all MoE lay-
+ers. The rapid drop and stabilization at low values (0.1–0.4)
+indicate successful expert load balancing.
+3.4 Hybrid Training Objectives
+Our framework optimizes a joint objective that unifies representa-
+tion learning with generative semantic modeling.
+3.4.1 Embedding Matching with Debiasing Correction.To align the
+sequence representationh 𝑇 with the target itemi +, we employ the
+InfoNCE loss. Crucially, to mitigate the popularity bias inherent in
+in-batch sampling, we incorporate aLogQ correction[8]:
+L𝑐𝑜𝑛 =−log exp(h ⊤
+𝑇 e𝑖+ −log𝑄(𝑖 +))Í
+𝑗∈B exp(h ⊤
+𝑇 e𝑗 −log𝑄(𝑗)) ,(2)
+where 𝑄(𝑖) denotes the estimated item popularity anderepresents
+item embeddings.
+3.4.2 Hierarchical Generative Modeling.We introduce a generative
+task to predict the discrete codesc =(𝑐 1, 𝑐2) of the target item. This
+is formulated as a hierarchical auto-regressive process:
+𝑝(c|h 𝑇 )=𝑝(𝑐 1|h𝑇 ) ·𝑝(𝑐 2|𝑐1,h 𝑇 ).(3)
+Specifically, the first-level code 𝑐1 is predicted by attending to the
+encoder output 𝐻 usingh 𝑇 as the query. For the second level, to
+enforce semantic consistency, we employ aTeacher-Forcingstrat-
+egy: the queryq 2 is constructed by fusingh 𝑇 with the embedding
+of the first code, i.e.,q 2 =MLP( [ h𝑇 ;E (𝑐1
+gt)]) , whereE (𝑐1
+gt) denotes
+the embedding representation of the ground-truth code 𝑐1 from the
+codebook. Both probabilities are optimized via cross-entropy losses,
+denoted asL 𝑐1 andL 𝑐2.
+3.4.3 Joint Optimization.The final objective balances the retrieval
+accuracy and semantic reconstruction:
+Ltotal =L 𝑐𝑜𝑛 +𝜆 1L𝑐1 +𝜆 2L𝑐2 .(4)
+4 Experiments
+4.1 Inference Setting
+Our inference process, illustrated in Figure 4, co-utilizes the model’s
+auto-regressive (SID) and dual-tower (InfoNCE) capabilities.
+(1) Stage 1: Auto-Regressive Candidate Generation (SID Beam
+Search).For a given user, we first use the model’s auto-regressive
+head to decode the most probable (sid1,sid2) sequences via
+Beam Search. We set the beam width to 𝐵= 20. We compute
+the joint log-probability 𝑃(sid1,sid2) and select the Top-K’ SID
+pairs with the highest scores. Here, K’ = 384. We then reverse-
+map these SIDs to retrieve a candidate items, denoted as𝐶 sid.
+(2) Stage 2: Dual-Tower Scoring (InfoNCE Scoring).We com-
+pute the user’s query embedding𝑞𝑢 and retrieve the item em-
+beddings for all items within the candidate set 𝐶sid generated
+in Stage 1. Instead of using the beam search generation scores,
+we re-rank the items in 𝐶sid using the cosine similarity scores
+𝑠(𝑞 𝑢, 𝑘𝑖 )from the InfoNCE dual-tower model.
+(3) Stage 3: Filtering Strategy.Before returning the final Top-10
+results, two key filtering strategies are applied:
+• Historical Behavior Filtering:We explicitly filter out any
+item that has already appeared in the user’s historical inter-
+action sequence by setting its re-ranking score to−∞.
+• Cold-Start Item Filtering:During the creation of the full
+candidate embedding matrix, all cold-start items (i.e., items
+not present in the training set) are discarded.
+The final recommended list consists of the Top-10 items from
+𝐶sid after InfoNCE re-ranking and filtering.
+
+===== PAGE 4 =====
+Conference’17, July 2017, Washington, DC, USA Jiangxia Cao, Shuo Yang, Zijun Wang, Qinghai Tan
+4.2 InfoNCE with Different Layers
+To validate the scaling properties of our model, we evaluated the
+performance of the InfoNCE ranking task across different model
+depths.
+We fixed other key hyperparameters: the model is an HSTU
+architecture with a hidden dimension 𝐷= 128, 8 attention heads,
+and Pre-LayerNorm.The maximum sequence length was 101 with a
+per-device batch size of 512.We used pure bfloat16 for training.For
+optimization, we employed the Muon optimizer with a learning
+rate of 0.08, momentum of 0.95, and a cosine annealing schedule
+with 2000 warmup steps. The InfoNCE loss used cosine similarity
+and a fixed temperature 𝜏= 0.02. We then varied the number of
+layers in the sequence encoder, ranging from 8 to 40.
+As shown in Table 3, we recorded the average training metrics
+for the last 100 batches after 1 epoch. The results clearly indicate a
+stable improvement in ranking performance (Hitrate and NDCG) as
+the number of layers increases, confirming our scaling hypothesis.
+Table 3: Final Model Performance with Different Layer Con-
+figurations (Avg. of Last 100 Batches, 1-Epoch)
+Layer Configuration Model Size Hitrate NDCG
+40 Layers 0.0573B 0.3219 0.1812
+32 Layers 0.0468B 0.3153 0.1752
+24 Layers 0.0363B 0.3027 0.1706
+16 Layers 0.0257B 0.2936 0.1672
+8 Layers 0.0152B 0.2770 0.1579
+Furthermore, we trained our optimal [40]-layer configuration
+(0.0573B) for multiple epochs to observe its convergence and over-
+fitting behavior. Table 4 details the validation/test metrics across
+epochs. While training metrics (like Hitrate) consistently rise, the
+validation metrics (Validation NDCG) peak at Epoch 6 (0.1064) be-
+fore showing signs of slight overfitting.
+Table 4: Valid/Test Performance Comparison across Epochs.
+Epoch Valid Test
+HR@10 NDCG@10 HR@10 NDCG@10
+5 0.1885 0.1062 0.1307 0.0717
+60.1888 0.10640.1313 0.0721
+7 0.1885 0.10610.1316 0.0723
+8 0.1879 0.1057 0.1313 0.0722
+4.3 SID with Different Layers
+We also evaluated the scaling properties of the auto-regressive SID
+generation task. We fixed key hyperparameters: the model is an
+HSTU architecture, 𝐷= 128, 8 attention heads, Pre-LN, AdamW
+optimizer with lr= 0.001, cosine annealing with 2000 warmup
+steps, and the InfoNCE loss was disabled.
+As shown in Table 5, increasing model depth (from 4 to 20 layers)
+consistently improves the accuracy (HR@10) for SID1/SID2.
+We also trained the [20]-layer configuration for multiple epochs
+and applied our hybrid inference strategy (SID Beam Search + In-
+foNCE ranking) for evaluation. Table 4 shows the validation results.
+Figure 4: The hybrid inference pipeline of OnePiece(SID
+beam search + InfoNCE Scoring).
+Table 5: HitRate@10 Performance with Different Layer Con-
+figurations (1 Epoch, Last 100 Batches Avg)
+Layer Configuration Model Size SID1 HR@10 SID2 HR@10
+20 Layer 0.0762B 0.5804 0.4419
+16 Layers 0.0657B 0.5761 0.4345
+12 Layers 0.0551B 0.5759 0.4280
+8 Layers 0.0446B 0.5749 0.4149
+4 Layers 0.0341B 0.5711 0.3979
+The performance peaks at Epoch 7 (NDCG@10 of 0.0723), suggest-
+ing the model achieves a balance of SID generation and InfoNCE
+ranking capabilities at this point.
+5 Conclusion
+This work demonstrates that the semantic generation and in-batch
+InfoNCE can be synergistically scaled within a unified backbone.
+Through our cascade framework, we empirically validated that both
+tasks adhere to power-law Scaling Laws, and effectively resolved
+high-frequency item collisions via a collaborative tokenizer. Future
+work will explore the behavior of Scaling Laws on larger-scale (e.g.,
+billion-parameter) multi-modal foundation models and investigate
+end-to-end differentiable optimization strategies to further unify
+the training process.
+Acknowledgement
+We thank the Tencent Advertising Algorithm competition (TAAC)
+organizers for providing several months the 7-card H20(96GB)
+computing resources and industrial-scale TencentGR-10M/100M
+datasets to help us explore the generative recommendation.
+References
+[1] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Floren-
+cia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal
+Anadkat, et al. 2023. Gpt-4 technical report.arXiv(2023).
+[2] Jiaxin Deng, Shiyao Wang, Kuo Cai, Lejian Ren, Qigen Hu, Weifeng Ding, Qiang
+Luo, and Guorui Zhou. 2025. Onerec: Unifying retrieve and rank with generative
+recommender and iterative preference alignment.arXiv preprint arXiv:2502.18965
+(2025).
+[3] Huifeng Guo, Ruiming Tang, Yunming Ye, Zhenguo Li, and Xiuqiang He. 2017.
+DeepFM: a factorization-machine based neural network for CTR prediction.arXiv
+
+===== PAGE 5 =====
+OnePiece Conference’17, July 2017, Washington, DC, USA
+preprint arXiv:1703.04247(2017).
+[4] Wang-Cheng Kang and Julian McAuley. 2018. Self-attentive sequential recom-
+mendation. InIEEE international conference on data mining (ICDM).
+[5] Chi Liu, Jiangxia Cao, Rui Huang, Kai Zheng, Qiang Luo, Kun Gai, and Guorui
+Zhou. 2024. KuaiFormer: Transformer-Based Retrieval at Kuaishou.arXiv preprint
+arXiv:2411.10057(2024).
+[6] Qi Pi, Weijie Bian, Guorui Zhou, Xiaoqiang Zhu, and Kun Gai. 2019. Practice
+on long sequential user behavior modeling for click-through rate prediction.
+InProceedings of the 25th ACM SIGKDD international conference on knowledge
+discovery & data mining. 2671–2679.
+[7] Qi Pi, Guorui Zhou, Yujing Zhang, Zhe Wang, Lejian Ren, Ying Fan, Xiaoqiang
+Zhu, and Kun Gai. 2020. Search-based user interest modeling with lifelong
+sequential behavior data for click-through rate prediction. InProceedings of the
+29th ACM International Conference on Information & Knowledge Management.
+2685–2692.
+[8] Xinyang Yi, Ji Yang, Lichan Hong, Derek Zhiyuan Cheng, Lukasz Heldt, Aditee
+Kumthekar, Zhe Zhao, Li Wei, and Ed Chi. 2019. Sampling-bias-corrected neural
+modeling for large corpus item recommendations. InProceedings of the 13th ACM
+conference on recommender systems. 269–277.
+[9] Jiaqi Zhai, Lucy Liao, Xing Liu, Yueming Wang, Rui Li, Xuan Cao, Leon Gao, Zhao-
+jie Gong, Fangda Gu, Michael He, et al. 2024. Actions speak louder than words:
+Trillion-parameter sequential transducers for generative recommendations.arXiv
+preprint arXiv:2402.17152(2024).
+[10] Guorui Zhou, Xiaoqiang Zhu, Chenru Song, Ying Fan, Han Zhu, Xiao Ma, Yanghui
+Yan, Junqi Jin, Han Li, and Kun Gai. 2018. Deep interest network for click-through
+rate prediction. InProceedings of the 24th ACM SIGKDD international conference
+on knowledge discovery & data mining. 1059–1068.
