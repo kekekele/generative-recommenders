@@ -921,53 +921,71 @@ class LocalNegativesSampler(NegativesSampler):
 
 ## FourierGeo Three Variants (Visualization)
 
-下面是目前已尝试的 3 种 `FourierGeo` 加载/融合方式的可视化对比。
+下面汇总当前已落地并训练验证过的 `FourierGeo` 融合方案（含 New-A / New-B）。
 
-公共主干（3 个 Variant 共用）：
+公共主干（所有方案共用）：
 
 - item_id -> item_emb: D
+- item_geo_fourier_features.csv (geo_fourier_0..127) -> Lookup 128-d
+- item_visit_time_features.csv (visit_hour_0..23) -> Lookup 24-d
 
-Variant-1: Online Random Fourier
+### 方案流程（文本流程图）
 
-- item_geo_fourier_features.csv (lat_norm/lon_norm)
-    -> Runtime Random Fourier Mapping
-    -> concat with visit_time(24)
-    -> Linear -> LayerNorm -> geo_delta(D)
-- 融合: item_emb + geo_delta
+V1: Online Random Fourier（早期）
 
-Variant-2: Offline Deterministic Fourier + Fixed Scale
+- lat/lon 运行时随机 Fourier 映射
+- concat visit_time(24)
+- Linear -> LayerNorm -> geo_delta(D)
+- 输出: item_emb + geo_delta
 
-- item_geo_fourier_features.csv (geo_fourier_0..127)
-    -> Lookup 128-d vector
-    -> concat with visit_time(24)
-    -> Linear -> geo_delta(D)
-- 融合: item_emb + 0.05 * geo_delta
+V2: Offline Deterministic Fourier + Fixed Scale（早期稳态）
 
-Variant-3: Offline Deterministic Fourier + Adaptive Gate
+- 预计算 geo_fourier_0..127
+- concat visit_time(24)
+- Linear -> geo_delta(D)
+- 输出: item_emb + 0.05 * geo_delta
 
-- item_geo_fourier_features.csv (geo_fourier_0..127)
-    -> Lookup 128-d vector
-    -> concat with visit_time(24)
-    -> Linear -> geo_delta(D)
-- 门控分支: gate_input = concat(item_emb, geo_delta)
-    -> gate = 0.2 * sigmoid(Linear)
-- 融合: item_emb + gate * geo_delta
+V3: Offline Deterministic Fourier + Adaptive Gate（当前主线之一）
+
+- 预计算 geo_fourier_0..127
+- concat visit_time(24)
+- Linear -> geo_delta(D)
+- gate_input = concat(item_emb, geo_delta)
+- gate = 0.2 * sigmoid(Linear)
+- 输出: item_emb + gate * geo_delta
+
+New-A: MLP(item)+MLP(geo)+MLP(visit_time) -> cat -> fusion（纯融合输出）
+
+- item 分支: MLP(item_emb)
+- geo 分支: MLP(geo_fourier)
+- visit 分支: MLP(visit_time)
+- cat 三分支后经 fusion MLP
+- 输出: fused_emb（不保留 item 残差锚点）
+
+New-B: New-A + item residual anchor（当前最优）
+
+- 与 New-A 同分支结构
+- 输出改为: item_emb + scale * fused_emb
+- 当前对照实验中，`geo_fourier_concat_b` 在峰值指标上优于 New-A 和 budget-concat-residual
 
 ### Variant Summary
 
-| Variant | Geo feature source | Fusion form | Key risk / behavior |
+| Variant | Fusion form | Strength | Risk |
 |---|---|---|---|
-| V1 | 在线由 `lat_norm/lon_norm` 运行时映射 | `Linear -> LayerNorm -> residual add` | geo 分支幅度过强，容易压过 item 主语义 |
-| V2 | 离线预计算 `geo_fourier_0..127` | `Linear -> residual add` with fixed `0.05` | 更稳定，作为弱修正项，易于对照验证 |
-| V3 | 离线预计算 `geo_fourier_0..127` | `Linear -> gated residual add` (`gate<=0.2`) | 自适应更强，但需要监控 gate 是否过大 |
+| V1 | `Linear -> LayerNorm -> add` | 表达强 | 训练不稳，易压过 item 主语义 |
+| V2 | `Linear -> 0.05 * add` | 简单稳态 | 上限偏低 |
+| V3 | `Linear -> gate -> add` | 自适应强 | 需监控 gate 漂移 |
+| New-A | `MLP(3-branch) -> cat -> fusion` | 交互表达更强 | 无锚点，后程易过拟合 |
+| New-B | `New-A + residual anchor` | 表达与稳定性平衡最好 | 仍需控制融合强度 |
 
 ### Current Recommendation
 
-1. 先以 `V2` 作为稳态 baseline（固定比例，稳定可复现）。
-2. 再用 `V3` 做 10-20 epoch 的短程 A/B，观察是否持续优于 `V2`。
-3. 对 `V3` 重点看 gate 日志趋势：
-     - 长期接近 0：geo 信号未被有效利用
-     - 快速接近上限：geo 可能重新变成过强分支
+1. 主线使用 `New-B`（`embedding_module_type = "geo_fourier_concat_b"`）。
+2. 融合强度优先测试 `scale=0.10/0.08/0.06`；当前实验结论为 `0.10 > 0.08 > 0.06`。
+3. 训练策略采用“峰值 checkpoint”而非最后 checkpoint：
+   - 当前最佳点通常在 epoch 20 左右。
+   - 30 epoch 后多方案进入平台并小范围震荡。
+4. `New-A` 和 budget-concat-residual 作为对照线保留，不建议作为默认生产训练配置。
 
 ```python
 @gin.configurable
